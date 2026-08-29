@@ -672,6 +672,19 @@ def _dispatch_authorized_once(
         if guardrail_decision.allows_execution:
             guardrail_decision = None
 
+    if block_message is None and guardrail_decision is None:
+        governance = getattr(agent, "cost_context_governance", None)
+        if governance is not None:
+            try:
+                governance_decision = governance.before_tool_call(ref.name, ref.args)
+                if governance_decision.get("action") == "hard_stop":
+                    block_message = governance_decision.get("message") or (
+                        f"Governança bloqueou nova chamada para {ref.name}."
+                    )
+                    block_error_type = "governance_block"
+            except Exception:
+                pass
+
     if block_message is not None or guardrail_decision is not None:
         _advance_start_order()
         state.blocked = True
@@ -998,6 +1011,18 @@ def _commit_tool_result(
                 agent._record_file_mutation_result(function_name, function_args, function_result, is_error)
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+            governance = getattr(agent, "cost_context_governance", None)
+            if governance is not None:
+                try:
+                    governance.record_tool_result(
+                        function_name,
+                        function_args,
+                        function_result,
+                        is_error=is_error,
+                        duration_seconds=tool_duration,
+                    )
+                except Exception:
+                    pass
         if agent.verbose_logging:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = verbose_text(function_result)

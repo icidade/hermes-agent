@@ -20,6 +20,7 @@ Hermes Agent includes a rich set of capabilities that extend far beyond basic ch
 - **[Context Files](context-files.md)** — Hermes automatically discovers and loads project context files (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules`) that shape how it behaves in your project.
 - **[Context References](context-references.md)** — Type `@` followed by a reference to inject files, folders, git diffs, and URLs directly into your messages. Hermes expands the reference inline and appends the content automatically.
 - **[Checkpoints](../checkpoints-and-rollback.md)** — Hermes automatically snapshots your working directory before making file changes, giving you a safety net to roll back with `/rollback` if something goes wrong.
+- **[Cost & Context Governance](cost-context-governance.md)** — Classify expensive work into budget profiles, preserve QA headroom, checkpoint partial handoffs, and narrow delegated toolsets before child agents start.
 
 ## Automation
 

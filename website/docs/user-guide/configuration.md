@@ -142,6 +142,74 @@ Cursor-style SecretRef syntax is also accepted: `${env:VAR_NAME}` resolves exact
 
 For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/integrations/providers).
 
+## Cost & Context Governance
+
+Hermes can attach a governance envelope to expensive work so it classifies the request, budgets model/tool usage, preserves a QA reserve, and checkpoints partial handoffs.
+
+```yaml
+cost_context_governance:
+  mode: observe                    # disabled | observe | enforce
+  workspace_dir: engagements
+  default_profile: conversational
+  force_for_profiles: [chief-of-staff]
+  engagement_keywords:
+    - miniciso
+    - security
+    - assessment
+    - review
+    - threat model
+    - appsec
+    - bug bounty
+  threshold:
+    informational_ratio: 0.50
+    warning_ratio: 0.70
+    approval_ratio: 0.85
+    hard_stop_ratio: 1.00
+  progress:
+    equivalent_tool_calls: 3
+    same_error_repeats: 3
+    no_progress_iterations: 4
+    timeout_checkpoint_seconds: 30
+  profiles:
+    conversational:
+      total_model_calls: 3
+      tool_invocations: 6
+      total_tokens: 9000
+      delegation_count: 0
+      qa_reserve_ratio: 0.0
+    bounded:
+      total_model_calls: 6
+      tool_invocations: 15
+      total_tokens: 26000
+      delegation_count: 1
+      qa_reserve_ratio: 0.10
+    standard_engagement:
+      total_model_calls: 8
+      tool_invocations: 25
+      total_tokens: 36000
+      delegation_count: 3
+      qa_reserve_ratio: 0.20
+    deep_engagement:
+      total_model_calls: 16
+      tool_invocations: 50
+      total_tokens: 84000
+      delegation_count: 4
+      qa_reserve_ratio: 0.25
+  role_toolsets:
+    chief: [delegation, todo, session_search, file, search, skills, browser, web]
+    sme: [file, search, terminal, web, browser]
+    qa: [file, search, terminal, web, browser, session_search]
+```
+
+Notes:
+
+- `observe` writes the engagement artifacts and telemetry without aggressively blocking work.
+- `enforce` can pause or hard-stop when projected usage would consume QA reserve or when a lane stalls.
+- `profiles` define the envelope for model calls, tokens, tool invocations, retries, delegated-task calls, and wall-clock time.
+- `role_toolsets` is applied to delegated children before the child agent starts, so first-turn tool access is already narrowed.
+
+See [Cost & Context Governance](/user-guide/features/cost-context-governance) for the full behavior and artifact model.
+
 ### Provider Timeouts
 
 You can set `providers.<id>.request_timeout_seconds` for a provider-wide request timeout, plus `providers.<id>.models.<model>.timeout_seconds` for a model-specific override. Applies to the primary turn client on every transport (OpenAI-wire, native Anthropic, Anthropic-compatible), the fallback chain, rebuilds after credential rotation, and (for OpenAI-wire) the per-request timeout kwarg — so the configured value wins over the legacy `HERMES_API_TIMEOUT` env var.

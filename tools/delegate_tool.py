@@ -66,6 +66,30 @@ def _normalize_role(r: Optional[str]) -> str:
         return "leaf"
     return r_norm
 
+
+def _infer_governance_role(goal: str, context: Optional[str], *, child_depth: int) -> str:
+    """Map delegated work to the governance lane without changing execution role."""
+    text = f"{goal or ''}\n{context or ''}".lower()
+    if any(marker in text for marker in ("security qa", "security-qa", "qa review", "quality assurance", "final review")):
+        return "qa"
+    return "sme" if child_depth > 0 else "chief"
+
+
+def _apply_governance_toolset_cap(parent_agent: Any, child_toolsets: list[str], *, governance_role: str) -> list[str]:
+    """Narrow inherited toolsets before child construction; never create a tool-less child."""
+    if getattr(parent_agent, "cost_context_governance", None) is None:
+        return child_toolsets
+    try:
+        cfg = _load_config().get("cost_context_governance") or {}
+        allowed = list((cfg.get("role_toolsets") or {}).get(governance_role) or [])
+        if cfg.get("mode") not in {"observe", "enforce"} or not allowed:
+            return child_toolsets
+        narrowed = [toolset for toolset in child_toolsets if toolset in set(allowed)]
+        return narrowed or child_toolsets
+    except Exception as exc:
+        logger.debug("Governance child toolset narrowing failed: %s", exc)
+        return child_toolsets
+
 DEFAULT_MAX_ITERATIONS = 250
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds (cycles of _HEARTBEAT_INTERVAL with no progress). Progress = iteration, current_tool OR
@@ -198,6 +222,10 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    governance_role = _infer_governance_role(goal, context, child_depth=child_depth)
+    child_toolsets = _apply_governance_toolset_cap(
+        parent_agent, child_toolsets, governance_role=governance_role
+    )
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -262,6 +290,21 @@ def _build_child_agent(
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
+    if getattr(parent_agent, "cost_context_governance", None) is not None:
+        try:
+            seed = parent_agent.cost_context_governance.allocate_child_budget(
+                child_task_id=subagent_id,
+                requested_profile=getattr(parent_agent, "_governance_profile_key", None),
+                selected_agents=[effective_role],
+            )
+            seed["selected_agents"] = [effective_role]
+            setattr(child, "_governance_seed", seed)
+            setattr(child, "_governance_engagement_id", seed.get("engagement_id"))
+            setattr(child, "_governance_profile_key", str(seed.get("profile_key") or "bounded"))
+            setattr(child, "_governance_request_class", str(seed.get("request_class") or "engagement"))
+            setattr(child, "_governance_role", governance_role)
+        except Exception as exc:
+            logger.debug("Governance child budget allocation failed: %s", exc)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
     try:
@@ -329,6 +372,23 @@ def _run_single_child(
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
+            child_governance = getattr(child, "cost_context_governance", None)
+            if child_governance is not None:
+                try:
+                    failure_entry["partial_handoff"] = child_governance.persist_partial_handoff(
+                        task=goal,
+                        status=failure_entry.get("status", "error"),
+                        summary=failure_entry.get("summary"),
+                        errors=[failure_entry.get("error", "Subagent did not complete.")],
+                        limitations=["Subagent did not complete within its governed execution envelope."],
+                        usage={
+                            "api_calls": failure_entry.get("api_calls", 0),
+                            "duration_seconds": failure_entry.get("duration_seconds", 0),
+                        },
+                        recommended_next_step="Retomar com escopo menor ou orçamento explicitamente aprovado.",
+                    )
+                except Exception:
+                    pass
             return failure_entry
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)

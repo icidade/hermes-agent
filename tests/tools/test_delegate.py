@@ -476,6 +476,59 @@ class TestDelegateTask(unittest.TestCase):
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["api_mode"], "anthropic_messages")
 
+    def test_child_applies_governance_toolset_cap_before_start(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "file", "web", "browser", "search", "session_search"]
+        parent.cost_context_governance = MagicMock()
+        parent._governance_profile_key = "standard_engagement"
+        parent.cost_context_governance.allocate_child_budget.return_value = {
+            "engagement_id": "eng-123",
+            "request_class": "engagement",
+            "profile_key": "standard_engagement",
+            "allocated_budget": {"total_model_calls": 2},
+            "budget_override": {"total_model_calls": 2},
+            "allowed": True,
+        }
+
+        gov_cfg = {
+            "cost_context_governance": {
+                "mode": "enforce",
+                "role_toolsets": {
+                    "chief": ["delegation", "todo"],
+                    "sme": ["file", "search", "terminal"],
+                    "qa": ["file", "search", "session_search"],
+                },
+            }
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=gov_cfg), patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Investigate runtime issue",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+
+        self.assertEqual(kwargs["enabled_toolsets"], ["terminal", "file", "search"])
+        self.assertEqual(mock_child._governance_role, "sme")
+        self.assertEqual(mock_child._governance_engagement_id, "eng-123")
+        self.assertEqual(mock_child._governance_profile_key, "standard_engagement")
+        self.assertEqual(mock_child._governance_request_class, "engagement")
+        parent.cost_context_governance.allocate_child_budget.assert_called_once_with(
+            child_task_id=mock_child._subagent_id,
+            requested_profile="standard_engagement",
+            selected_agents=["leaf"],
+        )
+
 class TestToolNamePreservation(unittest.TestCase):
     """Verify _last_resolved_tool_names is restored after subagent runs."""
 

@@ -597,6 +597,36 @@ error.
 
 **Rule of thumb:** Use `delegate_task` when the subtask requires reasoning, judgment, or multi-step problem solving. Use `execute_code` when you need mechanical data processing or scripted workflows.
 
+## Governance-aware delegation
+
+When `cost_context_governance.mode` is `observe` or `enforce`, delegated children do **not** inherit the parent's full budget by default.
+
+Instead, the parent allocates a child budget seed that carries:
+
+- `engagement_id`
+- `request_class`
+- `profile_key`
+- `budget_override`
+- `selected_agents`
+
+That seed is attached to the child before its first turn so the delegated lane joins the same engagement and budget ledger.
+
+### First-turn toolset narrowing
+
+Governance also applies a role-based toolset cap **before** the child `AIAgent` is constructed. This is separate from the execution `role="leaf"|"orchestrator"` toggle:
+
+- governance role `chief` — orchestration-oriented allowlist
+- governance role `sme` — implementation / investigation allowlist
+- governance role `qa` — narrower review/final-check allowlist
+
+This matters because the child starts life with the reduced toolset immediately, rather than being initialized with a broader set and narrowed later.
+
+### QA routing
+
+Delegated tasks that explicitly read like final review work — for example `security qa`, `qa review`, or `final review` — are routed into the QA governance lane so the child gets the tighter allowlist and the parent keeps review headroom.
+
+For the configuration surface and profile defaults, see [Cost & Context Governance](cost-context-governance.md).
+
 ## Configuration
 
 ```yaml

@@ -1482,6 +1482,18 @@ def _run_conversation_turn(
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
 
+    governance = getattr(agent, "cost_context_governance", None)
+    if governance is not None:
+        try:
+            governance.begin_turn(
+                user_message=_ctx.user_message,
+                system_message=system_message or "",
+                messages=_ctx.messages,
+                task_id=_ctx.effective_task_id,
+            )
+        except Exception:
+            pass
+
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not
     # the next; a SessionDB append failure (and its classified cause) halts only this turn;
@@ -1523,6 +1535,33 @@ def _run_conversation_turn(
             break
         if _pg.action == "continue":
             continue
+
+        if governance is not None:
+            try:
+                _gov_decision = governance.before_model_call(
+                    messages=s.api_messages or s.messages,
+                    approx_request_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
+                    api_call_count=s.api_call_count,
+                )
+                if _gov_decision.get("compact_context"):
+                    s.messages, s.active_system_prompt = agent._compress_context(
+                        s.messages,
+                        system_message,
+                        approx_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
+                        task_id=s.effective_task_id,
+                        focus_topic="cost-context-governance",
+                    )
+                    s.conversation_history = None
+                    continue
+                if _gov_decision.get("pause") or _gov_decision.get("stop"):
+                    s.final_response = _gov_decision.get("message") or (
+                        "Execução pausada pela governança de custo/contexto."
+                    )
+                    s.failed = False
+                    s._turn_exit_reason = "cost_context_governance_pause"
+                    break
+            except Exception:
+                pass
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
@@ -1532,6 +1571,18 @@ def _run_conversation_turn(
         early_result = _run_api_retry_loop(agent, s)
         if early_result is not None:
             return early_result
+
+        if governance is not None and s.response is not None:
+            try:
+                governance.record_model_usage(
+                    getattr(s.response, "usage", None),
+                    duration_seconds=float(s.api_duration or 0.0),
+                    retry_count=s.retry_count,
+                    approx_request_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
+                    response_text=getattr(s.assistant_message, "content", "") or "",
+                )
+            except Exception:
+                pass
 
         _rs = _run_phase(apply_retry_restarts, agent, s)
         if _rs.action == "break":
@@ -1609,6 +1660,16 @@ def run_conversation(
         moa_config=moa_config,
         turn_author=turn_author,
     )
+    governance = getattr(agent, "cost_context_governance", None)
+    if governance is not None:
+        try:
+            result["governance_summary"] = governance.close_turn(
+                status="completed" if result.get("completed") and not result.get("failed") else "partial",
+                final_response=result.get("final_response") or "",
+                termination_reason=result.get("turn_exit_reason") or "completed",
+            )
+        except Exception:
+            pass
     return export_current_turn_boundary(agent, result, user_message)
 
 

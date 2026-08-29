@@ -191,9 +191,17 @@ If you are new to the codebase:
 
 ### Agent Loop
 
-The synchronous orchestration engine (`AIAgent`, exposed by the `run_agent.py` facade; the loop lives in `agent/conversation_loop.py` and `agent/turn_*.py`). Handles provider selection, prompt construction, tool execution, retries, fallback, callbacks, compression, and persistence. Supports three API modes for different provider backends.
+The synchronous orchestration engine (`AIAgent`, exposed by the `run_agent.py` facade; the loop lives in `agent/conversation_loop.py` and `agent/turn_*.py`). Handles provider selection, prompt construction, tool execution, retries, fallback, callbacks, compression, persistence, and optional cost/context governance hooks. Supports three API modes for different provider backends.
 
 → [Agent Loop Internals](./agent-loop.md)
+
+### Cost & Context Governance
+
+`agent/cost_context_governance.py` adds an optional envelope controller for high-cost or multi-lane work. It classifies the request into a budget profile, writes per-engagement artifacts (`brief.json`, `budget.json`, `telemetry.jsonl`, handoffs), tracks projected usage before model/tool calls, and reserves budget for a QA lane.
+
+Governance metadata is seeded into delegated children before startup (`engagement_id`, `request_class`, `profile_key`, `budget_override`), and role-based toolset narrowing happens before the child `AIAgent` is instantiated. This keeps the first-turn tool schema aligned with the intended lane.
+
+→ [Cost & Context Governance](/user-guide/features/cost-context-governance)
 
 ### Prompt System
 
