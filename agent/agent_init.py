@@ -1605,8 +1605,35 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+
+    # Cost & Context Governance pre-tool filtering.
+    agent.cost_context_governance = None
+    agent._governance_role = "chief" if getattr(agent, "_delegate_depth", 0) == 0 else "sme"
+    _enabled_toolsets_runtime = enabled_toolsets
+    try:
+        from hermes_cli.config import load_config as _load_gov_cfg
+        from agent.cost_context_governance import build_governance_controller
+
+        _gov_cfg = (_load_gov_cfg().get("cost_context_governance") or {})
+        _gov_role_toolsets = dict((_gov_cfg.get("role_toolsets") or {}))
+        _role_allow = list(_gov_role_toolsets.get(agent._governance_role, []) or [])
+        _effective_enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else None
+        if _gov_cfg.get("mode") in {"observe", "enforce"} and _role_allow:
+            if _effective_enabled_toolsets is None:
+                _effective_enabled_toolsets = list(_role_allow)
+            else:
+                _role_allow_set = set(_role_allow)
+                _effective_enabled_toolsets = [ts for ts in _effective_enabled_toolsets if ts in _role_allow_set]
+            if not _effective_enabled_toolsets:
+                _effective_enabled_toolsets = list(_role_allow)
+        agent.cost_context_governance = build_governance_controller(agent, _gov_cfg)
+        _enabled_toolsets_runtime = list(_effective_enabled_toolsets) if _effective_enabled_toolsets is not None else None
+    except Exception:
+        pass
+
+    # Get available tools with filtering
     agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
+        enabled_toolsets=_enabled_toolsets_runtime,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
@@ -1625,6 +1652,12 @@ def init_agent(
                 print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+
+    if agent.cost_context_governance is not None:
+        try:
+            agent.cost_context_governance.record_tool_schema_metrics(agent.tools or [], [])
+        except Exception:
+            pass
 
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban

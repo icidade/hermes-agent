@@ -1892,9 +1892,232 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
-    # Adopt any ~/.hermes/.env credential/base-url edits made since the last
-    # turn — a Settings save updates .env but not this worker's client, which
-    # was built at agent init (#67821). No-op when .env is unchanged.
+    # Log conversation turn start for debugging/observability
+    _preview_text = _summarize_user_message_for_log(user_message)
+    _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
+    _msg_preview = _msg_preview.replace("\n", " ")
+    logger.info(
+        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        agent.session_id or "none", agent.model, agent.provider or "unknown",
+        agent.platform or "unknown", len(conversation_history or []),
+        _msg_preview,
+    )
+
+    # Initialize conversation (copy to avoid mutating the caller's list)
+    messages = list(conversation_history) if conversation_history else []
+
+    if getattr(agent, "cost_context_governance", None) is not None:
+        try:
+            agent.cost_context_governance.begin_turn(
+                user_message=user_message,
+                system_message=system_message or "",
+                messages=messages,
+                task_id=effective_task_id,
+            )
+        except Exception:
+            pass
+
+    # Hydrate todo store from conversation history (gateway creates a fresh
+    # AIAgent per message, so the in-memory store is empty -- we need to
+    # recover the todo state from the most recent todo tool response in history)
+    if conversation_history and not agent._todo_store.has_items():
+        agent._hydrate_todo_store(conversation_history)
+
+    # Hydrate per-session nudge counters from persisted history.
+    # Gateway creates a fresh AIAgent per inbound message (cache miss /
+    # 1h idle eviction / config-signature mismatch / process restart), so
+    # _turns_since_memory and _user_turn_count start at 0 every turn and
+    # the memory.nudge_interval trigger may never be reached. Reconstruct
+    # an effective count from prior user turns in conversation_history.
+    # Idempotent: a cached agent that already accumulated counters keeps
+    # them; only a freshly-built agent with empty in-memory state hydrates.
+    # See issue #22357.
+    if conversation_history and agent._user_turn_count == 0:
+        prior_user_turns = sum(
+            1 for m in conversation_history if m.get("role") == "user"
+        )
+        if prior_user_turns > 0:
+            agent._user_turn_count = prior_user_turns
+            if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
+                # % preserves original 1-in-N cadence rather than firing a
+                # review immediately on resume (which would surprise users
+                # whose session happened to land just past a multiple of N).
+                agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
+
+    # Prefill messages (few-shot priming) are injected at API-call time only,
+    # never stored in the messages list. This keeps them ephemeral: they won't
+    # be saved to session DB, session logs, or batch trajectories, but they're
+    # automatically re-applied on every API call (including session continuations).
+
+    # Track user turns for memory flush and periodic nudge logic
+    agent._user_turn_count += 1
+
+    # Reset the streaming context scrubber at the top of each turn so a
+    # hung span from a prior interrupted stream can't taint this turn's
+    # output.
+    scrubber = getattr(agent, "_stream_context_scrubber", None)
+    if scrubber is not None:
+        scrubber.reset()
+    # Reset the think scrubber for the same reason — an interrupted
+    # prior stream may have left us inside an unterminated block.
+    think_scrubber = getattr(agent, "_stream_think_scrubber", None)
+    if think_scrubber is not None:
+        think_scrubber.reset()
+
+    # Preserve the original user message (no nudge injection).
+    original_user_message = persist_user_message if persist_user_message is not None else user_message
+
+    # Track memory nudge trigger (turn-based, checked here).
+    # Skill trigger is checked AFTER the agent loop completes, based on
+    # how many tool iterations THIS turn used.
+    _should_review_memory = False
+    if (agent._memory_nudge_interval > 0
+            and "memory" in agent.valid_tool_names
+            and agent._memory_store):
+        agent._turns_since_memory += 1
+        if agent._turns_since_memory >= agent._memory_nudge_interval:
+            _should_review_memory = True
+            agent._turns_since_memory = 0
+
+    # Add user message
+    user_msg = {"role": "user", "content": user_message}
+    messages.append(user_msg)
+    current_turn_user_idx = len(messages) - 1
+    agent._persist_user_message_idx = current_turn_user_idx
+
+    if not agent.quiet_mode:
+        _print_preview = _summarize_user_message_for_log(user_message)
+        agent._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
+
+    # ── System prompt (cached per session for prefix caching) ──
+    # Built once on first call, reused for all subsequent calls.
+    # Only rebuilt after context compression events (which invalidate
+    # the cache and reload memory from disk).
+    #
+    # For continuing sessions (gateway creates a fresh AIAgent per
+    # message), we load the stored system prompt from the session DB
+    # instead of rebuilding.  Rebuilding would pick up memory changes
+    # from disk that the model already knows about (it wrote them!),
+    # producing a different system prompt and breaking the Anthropic
+    # prefix cache.
+    if agent._cached_system_prompt is None:
+        _restore_or_build_system_prompt(agent, system_message, conversation_history)
+
+    active_system_prompt = agent._cached_system_prompt
+
+    # ── Preflight context compression ──
+    # Before entering the main loop, check if the loaded conversation
+    # history already exceeds the model's context threshold.  This handles
+    # cases where a user switches to a model with a smaller context window
+    # while having a large existing session — compress proactively rather
+    # than waiting for an API error (which might be caught as a non-retryable
+    # 4xx and abort the request entirely).
+    if (
+        agent.compression_enabled
+        and len(messages) > agent.context_compressor.protect_first_n
+                            + agent.context_compressor.protect_last_n + 1
+    ):
+        # Include tool schema tokens — with many tools these can add
+        # 20-30K+ tokens that the old sys+msg estimate missed entirely.
+        _preflight_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        _compressor = agent.context_compressor
+        _defer_preflight = getattr(
+            _compressor,
+            "should_defer_preflight_to_real_usage",
+            lambda _tokens: False,
+        )
+        _preflight_deferred = _defer_preflight(_preflight_tokens)
+
+        if not _preflight_deferred:
+            # Keep the CLI/ACP context display in sync with what preflight
+            # actually measured.  The status bar reads
+            # ``compressor.last_prompt_tokens``, which otherwise only updates
+            # from a *successful* API response.  When the conversation has grown
+            # since the last successful call — or when compression then fails
+            # (e.g. the auxiliary summary model times out) and no fresh usage
+            # arrives — the bar stays stuck at the old, smaller value while
+            # preflight reports a much larger number, looking out of sync.
+            # Seed it with the fresh estimate (only ever revising upward; a real
+            # ``update_from_response`` will correct it after the next API call).
+            # Skipped when deferring — a deferred estimate is known to over-count
+            # vs the last real provider prompt, so trusting it for the display
+            # would re-introduce the very desync we're avoiding.
+            if _preflight_tokens > (_compressor.last_prompt_tokens or 0):
+                _compressor.last_prompt_tokens = _preflight_tokens
+
+        if _preflight_deferred:
+            logger.info(
+                "Skipping preflight compression: rough estimate ~%s >= %s, "
+                "but last real provider prompt was %s after compression",
+                f"{_preflight_tokens:,}",
+                f"{_compressor.threshold_tokens:,}",
+                f"{_compressor.last_real_prompt_tokens:,}",
+            )
+        elif _compressor.should_compress(_preflight_tokens):
+            logger.info(
+                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                f"{_preflight_tokens:,}",
+                f"{_compressor.threshold_tokens:,}",
+                agent.model,
+                f"{_compressor.context_length:,}",
+            )
+            agent._emit_status(
+                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                f">= {_compressor.threshold_tokens:,} threshold. "
+                "This may take a moment."
+            )
+            # May need multiple passes for very large sessions with small
+            # context windows (each pass summarises the middle N turns).
+            for _pass in range(3):
+                _orig_len = len(messages)
+                messages, active_system_prompt = agent._compress_context(
+                    messages, system_message, approx_tokens=_preflight_tokens,
+                    task_id=effective_task_id,
+                )
+                if len(messages) >= _orig_len:
+                    break  # Cannot compress further
+                # Compression created a new session — clear the history
+                # reference so _flush_messages_to_session_db writes ALL
+                # compressed messages to the new session's SQLite, not
+                # skipping them because conversation_history is still the
+                # pre-compression length.
+                conversation_history = None
+                # Fix: reset retry counters after compression so the model
+                # gets a fresh budget on the compressed context.  Without
+                # this, pre-compression retries carry over and the model
+                # hits "(empty)" immediately after compression-induced
+                # context loss.
+                agent._empty_content_retries = 0
+                agent._thinking_prefill_retries = 0
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+                agent._mute_post_response = False
+                # Re-estimate after compression
+                _preflight_tokens = estimate_request_tokens_rough(
+                    messages,
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
+                )
+                if not _compressor.should_compress(_preflight_tokens):
+                    break  # Under threshold or anti-thrash guard stopped it
+
+    # Plugin hook: pre_llm_call
+    # Fired once per turn before the tool-calling loop.  Plugins can
+    # return a dict with a ``context`` key (or a plain string) whose
+    # value is appended to the current turn's user message.
+    #
+    # Context is ALWAYS injected into the user message, never the
+    # system prompt.  This preserves the prompt cache prefix — the
+    # system prompt stays identical across turns so cached tokens
+    # are reused.  The system prompt is Hermes's territory; plugins
+    # contribute context alongside the user's input.
+    #
+    # All injected context is ephemeral (not persisted to session DB).
+    _plugin_user_context = ""
     try:
         agent._try_refresh_env_client_credentials()
     except Exception:
@@ -2637,6 +2860,30 @@ def run_conversation(
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
         )
+        if getattr(agent, "cost_context_governance", None) is not None:
+            try:
+                _gov_decision = agent.cost_context_governance.before_model_call(
+                    messages=api_messages,
+                    approx_request_tokens=approx_request_tokens,
+                    api_call_count=api_call_count,
+                )
+                if _gov_decision.get("compact_context"):
+                    messages, active_system_prompt = agent._compress_context(
+                        messages,
+                        system_message,
+                        approx_tokens=approx_request_tokens,
+                        task_id=effective_task_id,
+                        focus_topic="cost-context-governance",
+                    )
+                    continue
+                if _gov_decision.get("pause") or _gov_decision.get("stop"):
+                    final_response = _gov_decision.get("message") or "Execução pausada pela governança de custo/contexto."
+                    failed = False
+                    _turn_exit_reason = "cost_context_governance_pause"
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
+            except Exception:
+                pass
         if _runtime_context_error:
             final_response = _runtime_context_error
             failed = True
@@ -4186,6 +4433,18 @@ def run_conversation(
                             )
                         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
                             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
+
+                    if getattr(agent, "cost_context_governance", None) is not None:
+                        try:
+                            agent.cost_context_governance.record_model_usage(
+                                canonical_usage,
+                                duration_seconds=api_duration,
+                                retry_count=retry_count,
+                                approx_request_tokens=approx_request_tokens,
+                                response_text=assistant_content or "",
+                            )
+                        except Exception:
+                            pass
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
@@ -4438,6 +4697,17 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+                elif getattr(agent, "cost_context_governance", None) is not None:
+                    try:
+                        agent.cost_context_governance.record_model_usage(
+                            None,
+                            duration_seconds=api_duration,
+                            retry_count=retry_count,
+                            approx_request_tokens=approx_request_tokens,
+                            response_text=assistant_content or "",
+                        )
+                    except Exception:
+                        pass
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
@@ -8661,6 +8931,52 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+    # Background memory/skill review — runs AFTER the response is delivered
+    # so it never competes with the user's task for model attention.
+    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+        try:
+            agent._spawn_background_review(
+                messages_snapshot=list(messages),
+                review_memory=_should_review_memory,
+                review_skills=_should_review_skills,
+            )
+        except Exception:
+            pass  # Background review is best-effort
+
+    # Note: Memory provider on_session_end() + shutdown_all() are NOT
+    # called here — run_conversation() is called once per user message in
+    # multi-turn sessions. Shutting down after every turn would kill the
+    # provider before the second message. Actual session-end cleanup is
+    # handled by the CLI (atexit / /reset) and gateway (session expiry /
+    # _reset_session).
+
+    # Plugin hook: on_session_end
+    # Fired at the very end of every run_conversation call.
+    # Plugins can use this for cleanup, flushing buffers, etc.
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        _invoke_hook(
+            "on_session_end",
+            session_id=agent.session_id,
+            completed=completed,
+            interrupted=interrupted,
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+    except Exception as exc:
+        logger.warning("on_session_end hook failed: %s", exc)
+
+    if getattr(agent, "cost_context_governance", None) is not None:
+        try:
+            result["governance_summary"] = agent.cost_context_governance.close_turn(
+                status="completed" if completed and not failed else "partial",
+                final_response=final_response or "",
+                termination_reason=_turn_exit_reason,
+            )
+        except Exception:
+            pass
+
+    return result
 
 
 __all__ = ["run_conversation"]

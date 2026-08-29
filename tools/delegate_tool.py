@@ -1032,6 +1032,53 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _infer_governance_role(goal: str, context: Optional[str], *, child_depth: int) -> str:
+    """Infer the governance role for a delegated child.
+
+    Delegation roles (leaf/orchestrator) are execution capabilities, not
+    governance personas. Default delegated work to SME, but allow explicit QA
+    wording in the task brief to route the child into the narrower QA toolset.
+    """
+    text = f"{goal or ''}\n{context or ''}".lower()
+    qa_markers = (
+        "security qa",
+        "security-qa",
+        "qa review",
+        "quality assurance",
+        "final review",
+    )
+    if any(marker in text for marker in qa_markers):
+        return "qa"
+    return "sme" if child_depth > 0 else "chief"
+
+
+def _apply_governance_toolset_cap(parent_agent: Any, child_toolsets: list[str], *, governance_role: str) -> list[str]:
+    """Apply governance role-based toolset narrowing to delegated children.
+
+    This is done before AIAgent() construction so the child starts with the
+    reduced toolset on its very first turn. If the configured allowlist would
+    eliminate every inherited toolset, keep the inherited set rather than
+    silently spawning a tool-less child.
+    """
+    gov = getattr(parent_agent, "cost_context_governance", None)
+    if gov is None:
+        return child_toolsets
+    try:
+        cfg = _load_config().get("cost_context_governance") or {}
+        if cfg.get("mode") not in {"observe", "enforce"}:
+            return child_toolsets
+        role_toolsets = dict(cfg.get("role_toolsets") or {})
+        allowed = list(role_toolsets.get(governance_role, []) or [])
+        if not allowed:
+            return child_toolsets
+        allowed_set = set(allowed)
+        narrowed = [toolset for toolset in child_toolsets if toolset in allowed_set]
+        return narrowed or child_toolsets
+    except Exception as exc:
+        logger.debug("Governance child toolset narrowing failed: %s", exc)
+        return child_toolsets
+
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1727,6 +1774,13 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    governance_role = _infer_governance_role(goal, context, child_depth=child_depth)
+    child_toolsets = _apply_governance_toolset_cap(
+        parent_agent,
+        child_toolsets,
+        governance_role=governance_role,
+    )
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -2050,6 +2104,23 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+
+    if getattr(parent_agent, "cost_context_governance", None) is not None:
+        try:
+            parent_profile_key = getattr(parent_agent, "_governance_profile_key", None)
+            _seed = parent_agent.cost_context_governance.allocate_child_budget(
+                child_task_id=subagent_id,
+                requested_profile=parent_profile_key,
+                selected_agents=[effective_role],
+            )
+            _seed["selected_agents"] = [effective_role]
+            setattr(child, "_governance_seed", _seed)
+            setattr(child, "_governance_engagement_id", _seed.get("engagement_id"))
+            setattr(child, "_governance_profile_key", str(_seed.get("profile_key") or getattr(child, "_governance_profile_key", "bounded")))
+            setattr(child, "_governance_request_class", str(_seed.get("request_class") or "engagement"))
+            setattr(child, "_governance_role", governance_role)
+        except Exception as exc:
+            logger.debug("Governance child budget allocation failed: %s", exc)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -2919,6 +2990,27 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            _partial_handoff = None
+            _child_gov = getattr(child, "cost_context_governance", None) if child is not None else None
+            if _child_gov is not None:
+                try:
+                    _partial_handoff = _child_gov.persist_partial_handoff(
+                        task=goal,
+                        status="timeout" if is_timeout else "error",
+                        summary=None,
+                        errors=[_err],
+                        limitations=["Subagent did not complete within the allocated budget envelope."],
+                        usage={
+                            "api_calls": child_api_calls,
+                            "duration_seconds": duration,
+                        },
+                        recommended_next_step="Reduce scope, narrow toolsets, or increase the child budget with explicit approval.",
+                    )
+                    if not isinstance(_partial_handoff, dict):
+                        _partial_handoff = None
+                except Exception:
+                    pass
+
             _error_entry = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -2936,6 +3028,7 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "partial_handoff": _partial_handoff,
             }
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
@@ -3163,6 +3256,22 @@ def _run_single_child(
         )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+            _child_gov = getattr(child, "cost_context_governance", None) if child is not None else None
+            if _child_gov is not None:
+                try:
+                    entry["partial_handoff"] = _child_gov.persist_partial_handoff(
+                        task=goal,
+                        status="partial",
+                        summary=summary or None,
+                        errors=[entry["error"]],
+                        limitations=["Subagent exited without a usable summary before completing the assigned work."],
+                        usage={"api_calls": api_calls, "duration_seconds": duration},
+                        recommended_next_step="Resume from the saved handoff with a narrower follow-up task or a larger explicit envelope.",
+                    )
+                    if not isinstance(entry.get("partial_handoff"), dict):
+                        entry.pop("partial_handoff", None)
+                except Exception:
+                    pass
 
         # T1-24: schema-validation outcome — emitted ONLY when a schema was
         # requested, so legacy (schema-less) payloads keep their exact shape.
