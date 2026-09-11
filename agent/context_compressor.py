@@ -26,7 +26,8 @@ import sqlite3
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
@@ -56,6 +57,53 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+@dataclass
+class CompressionAuxCallResult:
+    """Authoritative lifecycle result for one auxiliary compression invocation."""
+
+    response: Any = None
+    request_id: str = ""
+    logical_call_id: str = ""
+    attempt_id: str = ""
+    request_kind: str = "compaction"
+    dispatch_status: str = "not_dispatched"
+    state: str = "untracked"
+    usage: Dict[str, Any] | None = None
+    usage_missing: bool = False
+    termination_reason: str | None = None
+    released_reason: str | None = None
+    error_message: str | None = None
+
+
+class CompressionGovernanceStop(RuntimeError):
+    """Raised when governance blocks an auxiliary compression model call."""
+
+    def __init__(self, message: str, *, result: CompressionAuxCallResult | None = None):
+        super().__init__(message)
+        self.result = result
+
+
+_COMPRESSION_AUX_RUNTIME: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("hermes_compression_aux_runtime", default=None)
+)
+_RUNTIME_UNSET = object()
+
+
+@contextlib.contextmanager
+def compression_aux_runtime(**overrides: Any):
+    current = _COMPRESSION_AUX_RUNTIME.get() or {}
+    merged = dict(current)
+    for key, value in overrides.items():
+        if value is _RUNTIME_UNSET:
+            continue
+        merged[key] = value
+    token = _COMPRESSION_AUX_RUNTIME.set(merged)
+    try:
+        yield merged
+    finally:
+        _COMPRESSION_AUX_RUNTIME.reset(token)
 
 
 # ── Pinned summary route ─────────────────────────────────────────────────
@@ -2442,6 +2490,253 @@ class ContextCompressor(ContextEngine):
                 else:
                     telemetry[key] = value
 
+    def _governance_seed(self) -> Dict[str, Any]:
+        seed = getattr(self, "_compression_telemetry_seed", None)
+        return seed if isinstance(seed, dict) else {}
+
+    def _aux_runtime(self) -> Dict[str, Any]:
+        runtime = _COMPRESSION_AUX_RUNTIME.get()
+        return dict(runtime) if isinstance(runtime, dict) else {}
+
+    def bind_auxiliary_runtime(
+        self,
+        *,
+        governance_controller: Any = _RUNTIME_UNSET,
+        logical_call_id: Any = _RUNTIME_UNSET,
+        api_call_count: Any = _RUNTIME_UNSET,
+        request_label: Any = _RUNTIME_UNSET,
+        aux_llm_callable: Any = _RUNTIME_UNSET,
+        aux_llm_configured: Any = _RUNTIME_UNSET,
+        governance_required: Any = _RUNTIME_UNSET,
+    ):
+        return compression_aux_runtime(
+            governance_controller=governance_controller,
+            logical_call_id=logical_call_id,
+            api_call_count=api_call_count,
+            request_label=request_label,
+            aux_llm_callable=aux_llm_callable,
+            aux_llm_configured=aux_llm_configured,
+            governance_required=governance_required,
+        )
+
+    @staticmethod
+    def _usage_raw_from_aux_response(response: Any) -> Any | None:
+        if isinstance(response, dict):
+            return response.get("usage")
+        return getattr(response, "usage", None)
+
+    def _resolve_aux_llm_callable(
+        self,
+        fallback: Callable[..., Any] | None = None,
+    ) -> Callable[..., Any]:
+        runtime = self._aux_runtime()
+        override = runtime.get("aux_llm_callable")
+        if callable(override):
+            return override
+        return fallback if callable(fallback) else call_llm
+
+    def _current_request_state(self, controller: Any, request_id: str) -> str:
+        try:
+            snapshot = controller._root_snapshot()
+            entry = ((snapshot.get("request_state") or {}).get(request_id) or {})
+            return str(entry.get("state") or "")
+        except Exception:
+            return ""
+
+    def _blocked_aux_result(
+        self,
+        *,
+        message: str,
+        logical_call_id: str,
+        termination_reason: str,
+        request_id: str = "",
+        attempt_id: str = "",
+        state: str = "blocked",
+    ) -> CompressionAuxCallResult:
+        return CompressionAuxCallResult(
+            response=None,
+            request_id=request_id,
+            logical_call_id=logical_call_id,
+            attempt_id=attempt_id,
+            request_kind="compaction",
+            dispatch_status="not_dispatched",
+            state=state,
+            usage=None,
+            usage_missing=True,
+            termination_reason=termination_reason,
+            error_message=message,
+        )
+
+    def _mark_compression_governance_stop(self, decision: Dict[str, Any], identity: Dict[str, Any] | None = None) -> None:
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if not isinstance(telemetry, dict):
+            return
+        telemetry["governance_stop"] = True
+        telemetry["governance_action"] = str(decision.get("action") or "hard_stop")
+        telemetry["termination_reason"] = str(decision.get("termination_reason") or "cost_context_governance_hard_stop")
+        telemetry["governance_message"] = str(decision.get("message") or "")
+        if isinstance(identity, dict):
+            telemetry["governance_request_id"] = str(identity.get("request_id") or "")
+            telemetry["governance_attempt_id"] = str(identity.get("attempt_id") or "")
+
+    def _call_governed_compression_llm(
+        self,
+        *,
+        call_kwargs: Dict[str, Any],
+        fallback_callable: Callable[..., Any] | None = None,
+    ) -> CompressionAuxCallResult:
+        seed = self._governance_seed()
+        runtime = self._aux_runtime()
+        controller = runtime.get("governance_controller")
+        logical_call_id = str(runtime.get("logical_call_id") or seed.get("logical_call_id") or "")
+        prompt_messages = list(call_kwargs.get("messages") or [])
+        request_label = str(runtime.get("request_label") or seed.get("request_label") or "request")
+        governance_required = bool(runtime.get("governance_required"))
+        llm_callable = self._resolve_aux_llm_callable(fallback_callable)
+
+        if controller is None or not logical_call_id:
+            if governance_required:
+                result = self._blocked_aux_result(
+                    message="Compression auxiliary call blocked: governance state unavailable before dispatch.",
+                    logical_call_id=logical_call_id,
+                    termination_reason="compaction_governance_state_unavailable",
+                )
+                self._mark_compression_governance_stop(
+                    {
+                        "action": "hard_stop",
+                        "termination_reason": result.termination_reason,
+                        "message": result.error_message,
+                    }
+                )
+                raise CompressionGovernanceStop(result.error_message or "", result=result)
+            response = llm_callable(**call_kwargs)
+            return CompressionAuxCallResult(
+                response=response,
+                usage_missing=self._usage_raw_from_aux_response(response) is None,
+            )
+
+        if getattr(controller, "_budget_file", None) is None:
+            result = self._blocked_aux_result(
+                message="Compression auxiliary call blocked: governance budget state is unavailable or uninitialized.",
+                logical_call_id=logical_call_id,
+                termination_reason="compaction_governance_state_unavailable",
+            )
+            self._mark_compression_governance_stop(
+                {
+                    "action": "hard_stop",
+                    "termination_reason": result.termination_reason,
+                    "message": result.error_message,
+                }
+            )
+            raise CompressionGovernanceStop(result.error_message or "", result=result)
+
+        identity = controller.allocate_request_identity(
+            logical_call_id=logical_call_id,
+            request_kind="compaction",
+            request_label=request_label,
+        )
+        result = CompressionAuxCallResult(
+            request_id=identity["request_id"],
+            logical_call_id=logical_call_id,
+            attempt_id=identity["attempt_id"],
+            request_kind="compaction",
+            dispatch_status="not_dispatched",
+            state="created",
+        )
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["governance_request_id"] = identity["request_id"]
+            telemetry["governance_attempt_id"] = identity["attempt_id"]
+            telemetry["logical_call_id"] = logical_call_id
+
+        approx_request_tokens = max(1, int(estimate_messages_tokens_rough(prompt_messages) or 1))
+        decision = controller.before_model_call(
+            request_id=identity["request_id"],
+            messages=prompt_messages,
+            approx_request_tokens=approx_request_tokens,
+            api_call_count=int(runtime.get("api_call_count") or seed.get("api_call_count") or 0),
+            logical_call_id=logical_call_id,
+            attempt_id=identity["attempt_id"],
+            request_kind="compaction",
+        )
+        result.state = self._current_request_state(controller, identity["request_id"]) or "evaluated"
+        if bool(decision.get("stop") or decision.get("pause")) or str(decision.get("action") or "allow") not in {"allow", "warning", "informational"}:
+            result.termination_reason = str(decision.get("termination_reason") or decision.get("action") or "compaction_governance_blocked")
+            if result.state not in {"blocked", "released_before_dispatch"}:
+                try:
+                    controller.finalize_request(identity["request_id"], "blocked", result.termination_reason)
+                except Exception:
+                    pass
+                result.state = self._current_request_state(controller, identity["request_id"]) or "blocked"
+            self._mark_compression_governance_stop(
+                {
+                    "action": str(decision.get("action") or "hard_stop"),
+                    "termination_reason": result.termination_reason,
+                    "message": str(decision.get("message") or "Compression auxiliary call blocked by governance."),
+                },
+                identity,
+            )
+            raise CompressionGovernanceStop(
+                str(decision.get("message") or "Compression auxiliary call blocked by governance."),
+                result=result,
+            )
+
+        if runtime.get("aux_llm_configured") is False:
+            controller.release_request(identity["request_id"], "compaction_provider_unconfigured")
+            result.state = self._current_request_state(controller, identity["request_id"]) or "released_before_dispatch"
+            result.released_reason = "compaction_provider_unconfigured"
+            result.termination_reason = "compaction_provider_unconfigured"
+            err = RuntimeError("No LLM provider configured for compression auxiliary call.")
+            err.compression_aux_result = result
+            raise err
+
+        dispatched = False
+        started_at = time.monotonic()
+        try:
+            controller.record_dispatch(identity["request_id"])
+            dispatched = True
+            result.dispatch_status = "dispatched"
+            result.state = "dispatched"
+            response = llm_callable(**call_kwargs)
+            raw_usage = self._usage_raw_from_aux_response(response)
+            result.usage_missing = raw_usage is None
+            canonical_usage = controller.reconcile_usage(
+                identity["request_id"],
+                raw_usage,
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+                approx_request_tokens=approx_request_tokens,
+                response_text="",
+            )
+            controller.finalize_request(identity["request_id"], "completed", "compaction_model_call_completed")
+            result.response = response
+            result.usage = canonical_usage
+            result.state = self._current_request_state(controller, identity["request_id"]) or "completed"
+            result.termination_reason = "compaction_model_call_completed"
+            return result
+        except CompressionGovernanceStop:
+            raise
+        except BaseException as exc:
+            result.error_message = str(exc)
+            if dispatched:
+                reason = "interrupted" if isinstance(exc, (KeyboardInterrupt, AuxiliaryExplicitCancellation)) else "provider_error"
+                controller.account_dispatched_request_failure(
+                    identity["request_id"],
+                    reason=reason,
+                    duration_seconds=max(0.0, time.monotonic() - started_at),
+                    retry_count=0,
+                    response_text="",
+                    error_message=str(exc),
+                )
+                result.state = self._current_request_state(controller, identity["request_id"]) or self._terminal_accounting_state(reason)
+                result.termination_reason = reason
+            else:
+                controller.release_request(identity["request_id"], "compaction_no_provider_dispatch")
+                result.state = self._current_request_state(controller, identity["request_id"]) or "released_before_dispatch"
+                result.released_reason = "compaction_no_provider_dispatch"
+                result.termination_reason = "compaction_no_provider_dispatch"
+            exc.compression_aux_result = result
+            raise
+
     def _emit_init_summary_once(self) -> None:
         """Emit the informative startup line once, on first resolution.
 
@@ -4760,20 +5055,24 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if not segment.strip():
                 continue
             try:
-                from agent.auxiliary_client import call_llm
+                from agent.auxiliary_client import call_llm as digest_call_llm
 
                 # During a stall-fallback retry, follow the summary onto the
                 # pinned healthy route (non-consuming read) instead of
                 # re-addressing the stalled task backend (#96634 follow-up).
-                resp = call_llm(
-                    messages=[{
-                        "role": "user",
-                        "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
-                    }],
-                    task="compression",
-                    max_tokens=_LEAN_DIGEST_MAX_TOKENS,
-                    **attempt_summary_route_kwargs(),
+                aux_result = self._call_governed_compression_llm(
+                    call_kwargs={
+                        "messages": [{
+                            "role": "user",
+                            "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
+                        }],
+                        "task": "compression",
+                        "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
+                        **attempt_summary_route_kwargs(),
+                    },
+                    fallback_callable=digest_call_llm,
                 )
+                resp = aux_result.response
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -5242,7 +5541,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             call_kwargs["latency_info"] = _latency_info
             try:
                 with aux_interrupt_protection():
-                    response = call_llm(**call_kwargs)
+                    aux_result = self._call_governed_compression_llm(call_kwargs=call_kwargs)
+                    response = aux_result.response
             finally:
                 route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
                 _aux_provider = _aux_route.get("provider") or self.provider or ""
@@ -6963,7 +7263,8 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         try:
             with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                aux_result = self._call_governed_compression_llm(call_kwargs=call_kwargs)
+                response = aux_result.response
         except Exception as exc:
             logger.info("micro-summarization call failed: %s", exc)
             return None

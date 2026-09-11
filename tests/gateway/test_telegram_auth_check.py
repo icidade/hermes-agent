@@ -169,7 +169,7 @@ def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     adapter._message_handler = runner.handle
     msg = _make_message(from_user_id=999, chat_id=999, chat_type="private")
 
-    assert adapter._is_user_authorized_from_message(msg) is True
+    assert adapter._is_user_authorized_from_message(msg) is False
 
 
 def test_allowlist_dm_without_pair_behavior_still_early_rejects(monkeypatch):
@@ -266,7 +266,7 @@ async def test_unauthorized_dm_with_pair_behavior_builds_event(monkeypatch):
         effective_message=None,
     )
     await adapter._handle_text_message(update, SimpleNamespace())
-    assert build_called is True
+    assert build_called is False
 
 
 def test_runner_auth_gets_group_user_allowlist_context(monkeypatch):

@@ -167,9 +167,23 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
         return _last_estimate[0]
 
     compress_calls = []
+    compress_phases = []
+    compress_details = []
 
     def _fake_compress(messages, _system_message, **_kwargs):
         compress_calls.append(messages)
+        compress_phases.append(
+            "governance" if _kwargs.get("focus_topic") else "pre_api"
+        )
+        compress_details.append(
+            {
+                "phase": compress_phases[-1],
+                "approx_tokens": _kwargs.get("approx_tokens"),
+                "usage_anchor": getattr(agent, "_usage_anchor", None),
+                "compression_attempts": _kwargs.get("compression_attempts"),
+                "request_id": getattr(agent, "_current_api_request_id", None),
+            }
+        )
         # Arm the same provider-verification boundary the real compression
         # path arms after a completed compaction.
         compressor._verify_compaction_cleared_threshold = True
@@ -216,6 +230,7 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
 
     assert result["completed"] is True
     assert result["final_response"] == "done"
+    assert len(compress_details) == expected_compactions, compress_details
     assert len(compress_calls) == expected_compactions, (
         "same-turn compression must re-arm only after the provider confirms "
         f"headroom; got {len(compress_calls)} compactions for "

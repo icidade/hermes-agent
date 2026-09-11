@@ -13331,6 +13331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter.set_platform_event_handler(self._primary_platform_event_handler())
+            adapter.set_budget_authorization_handler(self._make_budget_authorization_handler())
             adapter._busy_text_mode = self._busy_text_mode
             _pending_connects.append((platform, platform_config, adapter))
 
@@ -15135,6 +15136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
+                    adapter.set_budget_authorization_handler(self._make_budget_authorization_handler())
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -16243,6 +16245,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_platform_event_handler(
             self._make_profile_platform_event_handler(profile_name)
         )
+        adapter.set_budget_authorization_handler(
+            self._make_budget_authorization_handler(profile_name)
+        )
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
         adapter._busy_text_mode = (
             text_modes.get(profile_name, self._busy_text_mode)
@@ -16585,6 +16590,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
+
+    def _make_budget_authorization_handler(self, profile_name: str | None = None):
+        """Bridge authenticated Telegram callbacks to the cached controller."""
+        async def _handler(callback: dict, principal: dict):
+            from gateway.session import SessionSource
+
+            chat_type = str(principal.get("chat_type") or "dm").strip().lower() or "dm"
+            if chat_type == "private":
+                chat_type = "dm"
+            elif chat_type == "supergroup":
+                chat_type = "forum" if principal.get("thread_id") is not None else "group"
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=str(principal.get("chat_id") or ""),
+                chat_type=chat_type,
+                user_id=str(principal.get("subject") or ""),
+                thread_id=str(principal.get("thread_id") or "") or None,
+                profile=profile_name,
+            )
+            key = self._session_key_for_source(source)
+            cached = getattr(self, "_agent_cache", {}).get(key)
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            controller = getattr(agent, "cost_context_governance", None) if agent else None
+            if controller is None:
+                raise RuntimeError("authorization session unavailable")
+            # Scope values are resolved from the cached runtime, never accepted
+            # from callback data or user text.
+            principal = {
+                **principal,
+                "profile": controller.profile_name,
+                "engagement_id": controller.engagement_id,
+                "task_id": controller.task_id,
+            }
+            result = controller.submit_budget_authorization_callback(
+                callback_token=str(callback["callback_token"]),
+                principal=principal,
+                approved=bool(callback["approved"]),
+                reason="Telegram authenticated callback decision",
+            )
+            return {"status": result.get("status"), "message": "Autorização processada; retomada pendente."}
+
+        return _handler
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""

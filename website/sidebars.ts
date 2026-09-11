@@ -84,6 +84,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/context-files',
             'user-guide/features/context-references',
             'user-guide/features/mixture-of-agents',
+            'user-guide/features/cost-context-governance',
             'user-guide/features/personality',
             'user-guide/features/skins',
             'user-guide/features/plugins',

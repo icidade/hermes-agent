@@ -1410,12 +1410,16 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         self.context_compressor.threshold_tokens = 1
         self.context_compressor.protect_first_n = 1
         self.context_compressor.protect_last_n = 1
-        self.context_compressor.compress = MagicMock(
-            return_value=[
+        lifecycle = []
+
+        def _compress_snapshot(*_args, **_kwargs):
+            lifecycle.append("compress")
+            return [
                 {"role": "user", "content": "[CONTEXT COMPACTION] review summary"},
                 {"role": "assistant", "content": "summary acknowledged"},
             ]
-        )
+
+        self.context_compressor.compress = MagicMock(side_effect=_compress_snapshot)
         # Compress on the first pressure check after the first response, then
         # stand down so the compacted request proceeds instead of looping.
         _should_compress_calls = {"count": 0}
@@ -1442,10 +1446,12 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
         self.context_compressor.select_context = MagicMock(return_value=None)
         self._compression_feasibility_checked = True
         self.client = MagicMock()
-        self.client.chat.completions.create.side_effect = [
-            _tool_response(100),
-            _final_response(),
-        ]
+
+        def _provider_call(*_args, **_kwargs):
+            lifecycle.append("provider")
+            return _tool_response(100) if lifecycle.count("provider") == 1 else _final_response()
+
+        self.client.chat.completions.create.side_effect = _provider_call
         self._disable_streaming = True
         self._use_prompt_caching = False
 
@@ -1464,6 +1470,7 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
 
         result = real_run_conversation(self, *args, **kwargs)
         captured["compression_calls"] = self.context_compressor.compress.call_count
+        captured["lifecycle"] = list(lifecycle)
         create = self.client.chat.completions.create
         captured["create_calls"] = create.call_count
         captured["outbound"] = [
@@ -1480,6 +1487,10 @@ def test_review_fork_compacts_oversized_snapshot_in_memory(tmp_path: Path) -> No
             "snapshot. compression_enabled was historically set False on the "
             "fork, which removed the only bound on the replayed snapshot "
             "(issue #93057)."
+        )
+        assert captured["lifecycle"][:2] == ["provider", "compress"], (
+            "review fork compacted before its initial provider replay: "
+            f"lifecycle={captured['lifecycle']!r}"
         )
         assert captured["create_calls"] == 2, (
             f"expected a 2-request review (tool call + final), "

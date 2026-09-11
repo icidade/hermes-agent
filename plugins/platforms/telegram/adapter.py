@@ -53,7 +53,7 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
 
         return _platform_gate_env(name, default)
     except Exception:
-        return (os.getenv(name) or default).strip()
+        return default.strip()
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
@@ -1168,6 +1168,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    @staticmethod
+    def _effective_thread_id(value: Any) -> Optional[str]:
+        """Normalize Telegram thread identity once at the auth boundary."""
+        if value is None or isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        return text or None
+
     def _is_callback_user_authorized(
         self,
         user_id: str,
@@ -1189,10 +1197,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 from gateway.session import SessionSource
 
                 normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+                effective_thread_id = self._effective_thread_id(thread_id)
                 if normalized_chat_type == "private":
                     normalized_chat_type = "dm"
                 elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
+                    normalized_chat_type = "forum" if effective_thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1200,15 +1209,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_type=normalized_chat_type,
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
-                    thread_id=str(thread_id) if thread_id is not None else None,
+                    thread_id=effective_thread_id,
                 )
                 return bool(auth_fn(source))
             except Exception:
-                logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
-                    normalized_user_id,
-                    exc_info=True,
-                )
+                logger.debug("[Telegram] Callback authorization failed closed")
+                return False
 
         allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
@@ -1252,24 +1258,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_type == "private":
             chat_type = "dm"
         elif chat_type == "supergroup":
-            thread_id_raw = getattr(message, "message_thread_id", None)
+            thread_id_raw = self._effective_thread_id(getattr(message, "message_thread_id", None))
             is_topic_message = bool(getattr(message, "is_topic_message", False))
             is_forum_group = getattr(chat, "is_forum", False) is True
             chat_type = (
                 "forum"
-                if thread_id_raw is not None and (is_topic_message or is_forum_group)
+                if thread_id_raw is not None
                 else "group"
             )
 
         thread_id = None
-        thread_id_raw = getattr(message, "message_thread_id", None)
+        thread_id_raw = self._effective_thread_id(getattr(message, "message_thread_id", None))
         if thread_id_raw is not None:
             is_topic_message = bool(getattr(message, "is_topic_message", False))
             is_forum_group = getattr(chat, "is_forum", False) is True
-            if chat_type == "forum" and (is_topic_message or is_forum_group):
-                thread_id = str(thread_id_raw)
+            if chat_type == "forum":
+                thread_id = thread_id_raw
             elif chat_type == "dm" and is_topic_message:
-                thread_id = str(thread_id_raw)
+                thread_id = thread_id_raw
 
         return SessionSource(
             platform=Platform.TELEGRAM,
@@ -1433,7 +1439,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     )
                 except Exception:
-                    pass
+                    return False
 
         if authorized is None:
             # Resolve through the runner's full auth chain (platform + group
@@ -1449,11 +1455,6 @@ class TelegramAdapter(BasePlatformAdapter):
             auth_fn = getattr(runner, "_is_user_authorized", None)
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or callable(auth_fn):
-                # Only make an early decision when an allowlist actually exists;
-                # otherwise unknown DMs must reach the pairing flow rather than
-                # being default-denied here.
-                if not self._telegram_auth_env_configured():
-                    return True
                 decision = (
                     self._is_sender_authorized(
                         user_id,
@@ -1463,17 +1464,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     if has_callback
                     else None
                 )
-                if decision is not None:
-                    authorized = decision
+                if has_callback:
+                    return decision is True
                 elif callable(auth_fn):
                     try:
-                        authorized = bool(auth_fn(source))
+                        return bool(auth_fn(source))
                     except Exception:
-                        logger.debug(
-                            "[Telegram] Falling back to env-only auth for user %s",
-                            user_id,
-                            exc_info=True,
-                        )
+                        logger.debug("[Telegram] Authorization failed closed")
+                        return False
 
         if authorized is None:
             allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
@@ -7181,6 +7179,41 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _handle_budget_authorization_callback(self, query) -> bool:
+        """Process a budget callback before any ordinary message/LLM path."""
+        handler = getattr(self, "_budget_authorization_handler", None)
+        if not callable(handler):
+            await query.answer(text="Authorization unavailable.")
+            return True
+        parts = str(getattr(query, "data", "")).split(":", 2)
+        if len(parts) != 3 or parts[0] != "ba" or parts[2] not in {"a", "d"}:
+            await query.answer(text="Invalid authorization callback.")
+            return True
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        # These values come exclusively from the authenticated PTB update.
+        principal = {
+            "authenticated": True,
+            "authentication_source": "gateway_adapter",
+            "subject": str(getattr(user, "id", "")),
+            "platform": "telegram",
+            "chat_id": str(getattr(chat, "id", "")),
+            "chat_type": str(getattr(chat, "type", "")),
+            "thread_id": str(getattr(message, "message_thread_id", "") or ""),
+        }
+        try:
+            result = await handler(
+                {"callback_token": parts[1], "approved": parts[2] == "a"},
+                principal,
+            )
+            text = result if isinstance(result, str) else (result or {}).get("message", "Authorization processed.")
+        except Exception:
+            logger.info("Telegram budget authorization denied or unavailable")
+            text = "Authorization denied, expired, consumed, or invalid."
+        await query.answer(text=str(text)[:200])
+        return True
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7189,6 +7222,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+        if data.startswith("ba:"):
+            await self._handle_budget_authorization_callback(query)
+            return
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
         query_chat = getattr(query_message, "chat", None)

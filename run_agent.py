@@ -8632,7 +8632,12 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
-        effective_task_id = task_id or str(uuid.uuid4())
+        effective_task_id = (
+            task_id
+            or getattr(self, "_governance_resume_task_id", None)
+            or getattr(self, "_current_task_id", None)
+            or str(uuid.uuid4())
+        )
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {
             "session_id": session_id,

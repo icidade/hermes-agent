@@ -3148,6 +3148,9 @@ class BasePlatformAdapter(ABC):
         self._platform_event_handler: Optional[
             Callable[[Dict[str, Any], Any], Awaitable[None]]
         ] = None
+        self._budget_authorization_handler: Optional[
+            Callable[[Dict[str, Any], Dict[str, Any]], Awaitable[Dict[str, Any] | str | None]]
+        ] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -3824,6 +3827,10 @@ class BasePlatformAdapter(ABC):
         """
         self._platform_event_handler = handler
 
+    def set_budget_authorization_handler(self, handler) -> None:
+        """Install the authenticated, pre-LLM budget callback boundary."""
+        self._budget_authorization_handler = handler
+
     def set_topic_recovery_fn(
         self,
         fn: Optional[Callable[[Any], Optional[str]]],
@@ -3913,10 +3920,7 @@ class BasePlatformAdapter(ABC):
         try:
             return bool(self._authorization_check(user_id, chat_type, chat_id))
         except Exception:
-            logger.warning(
-                "[%s] Authorization check raised for user %s; treating as unknown",
-                self.name, user_id, exc_info=True,
-            )
+            logger.warning("Authorization check raised; treating as unknown")
             return None
     
     def set_session_store(self, session_store: Any) -> None:

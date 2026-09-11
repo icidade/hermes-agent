@@ -684,6 +684,15 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    # This flag is runtime-owned: only gateway-created agents with a concrete
+    # sender identity may bind a budget authorization challenge to an owner.
+    # Model text and config values never set it.
+    agent._governance_owner_identity_trusted = bool(
+        gateway_session_key and user_id and platform
+    )
+    agent._governance_callback_capability = (
+        object() if agent._governance_owner_identity_trusted else None
+    )
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1632,12 +1641,31 @@ def init_agent(
         pass
 
     # Get available tools with filtering
+    _all_tool_defs = None
+    if agent.cost_context_governance is not None:
+        try:
+            _all_tool_defs = _ra().get_tool_definitions(
+                enabled_toolsets=None,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+            )
+        except Exception:
+            _all_tool_defs = None
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=_enabled_toolsets_runtime,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
-    
+    if agent.cost_context_governance is not None:
+        try:
+            agent.tools = agent.cost_context_governance.filter_tool_schemas(
+                agent.tools or [],
+                total_available=_all_tool_defs or agent.tools or [],
+            )
+        except Exception:
+            # Never expose the pre-governance schema set after a filter error.
+            agent.tools = []
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:

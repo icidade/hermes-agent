@@ -1233,11 +1233,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     block_result = agent._guardrail_block_result(guardrail_decision)
             if block_result is None and getattr(agent, "cost_context_governance", None) is not None:
                 try:
-                    _gov_tool = agent.cost_context_governance.before_tool_call(function_name, function_args)
-                    if _gov_tool.get("action") == "hard_stop":
-                        block_result = json.dumps({"error": _gov_tool.get("message")}, ensure_ascii=False)
-                except Exception:
-                    pass
+                    governance = agent.cost_context_governance
+                    _gov_tool = governance.before_tool_call(function_name, function_args)
+                    _gov_tool = governance.validate_decision(
+                        _gov_tool,
+                        request_id=f"tool:{function_name}",
+                    )
+                    if not _gov_tool["allowed"]:
+                        block_result = json.dumps({"error": _gov_tool.get("message") or _gov_tool.get("reason")}, ensure_ascii=False)
+                except Exception as exc:
+                    if agent.cost_context_governance.should_enforce():
+                        block_result = json.dumps({"error": f"invalid governance decision: {exc}"}, ensure_ascii=False)
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -2166,11 +2172,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _guardrail_block_decision = guardrail_decision
             elif getattr(agent, "cost_context_governance", None) is not None:
                 try:
-                    _gov_tool = agent.cost_context_governance.before_tool_call(function_name, function_args)
-                    if _gov_tool.get("action") == "hard_stop":
-                        _block_msg = _gov_tool.get("message") or f"Governance blocked tool call: {function_name}"
-                except Exception:
-                    pass
+                    governance = agent.cost_context_governance
+                    _gov_tool = governance.before_tool_call(function_name, function_args)
+                    _gov_tool = governance.validate_decision(
+                        _gov_tool,
+                        request_id=f"tool:{function_name}",
+                    )
+                    if not _gov_tool["allowed"]:
+                        _block_msg = _gov_tool.get("message") or _gov_tool.get("reason") or f"Governance blocked tool call: {function_name}"
+                except Exception as exc:
+                    if agent.cost_context_governance.should_enforce():
+                        _block_msg = f"invalid governance decision: {exc}"
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 
@@ -2246,7 +2258,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if function_name == "todo":
+        if _execution_blocked:
+            middleware_trace = []
+            _execution_dispatched = False
+            if _block_msg is not None:
+                function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            elif _guardrail_block_decision is not None:
+                function_result = agent._guardrail_block_result(_guardrail_block_decision)
+            else:
+                function_result = json.dumps({"error": f"Tool execution blocked: {function_name}"}, ensure_ascii=False)
+            tool_duration = 0.0
+        elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
