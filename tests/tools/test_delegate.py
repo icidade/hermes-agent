@@ -527,6 +527,7 @@ class TestDelegateTask(unittest.TestCase):
             child_task_id=mock_child._subagent_id,
             requested_profile="standard_engagement",
             selected_agents=["leaf"],
+            governance_role="sme",
         )
 
 class TestToolNamePreservation(unittest.TestCase):

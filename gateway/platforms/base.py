@@ -2187,6 +2187,10 @@ class BasePlatformAdapter(ABC):
         closed."""
         self._platform_event_handler = handler
 
+    def set_budget_authorization_handler(self, handler) -> None:
+        """Install the authenticated, pre-LLM budget callback boundary."""
+        self._budget_authorization_handler = handler
+
     def set_topic_recovery_fn(self, fn: Optional[Callable[[Any], Optional[str]]]) -> None:
         """Install a thread_id-recovery hook (Telegram DM topic mode): called with ``event.source``
         before session keying; a non-None return replaces ``source.thread_id``. ``None`` clears
@@ -2245,8 +2249,8 @@ class BasePlatformAdapter(ABC):
         try:
             result = self._authorization_check(user_id, chat_type, chat_id, **extra)
         except Exception:
-            logger.warning("[%s] Authorization check raised for user %s; treating as unknown",
-                           self.name, user_id, exc_info=True)
+            logger.warning("[%s] Authorization check failed for user %s; treating as unknown",
+                           self.name, user_id)
             return None
         if result is True or result is False:
             return result

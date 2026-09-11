@@ -1554,10 +1554,11 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
 
     # Registry tools: post hook is owned by this executor (inner observer suppressed).
     def _execute(next_args: dict) -> Any:
+        from run_agent import handle_function_call
         import model_tools
 
         with model_tools.suppress_post_tool_call_hook():
-            return model_tools.handle_function_call(
+            return handle_function_call(
                 function_name,
                 next_args,
                 effective_task_id,

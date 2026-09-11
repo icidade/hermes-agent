@@ -44,6 +44,10 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
         from gateway.authz_mixin import _platform_gate_env
         return _platform_gate_env(name, default)
     except Exception:
+        with contextlib.suppress(Exception):
+            from agent.secret_scope import current_secret_scope, is_multiplex_active
+            if current_secret_scope() is not None and is_multiplex_active():
+                return default
         return (os.getenv(name) or default).strip()
 
 
@@ -771,7 +775,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return bool(auth_fn(source))
             except Exception:
                 logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s", normalized_user_id, exc_info=True)
+                    "[Telegram] Callback authorization failed for user %s", normalized_user_id, exc_info=True)
+                return False
         decision = self._env_allowlist_decision(normalized_user_id)
         if decision is None:
             # Fail-closed: no allowlist means deny unless GATEWAY_ALLOW_ALL_USERS is set.
@@ -871,6 +876,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if adapter_allow_from is not None:
             allowed = _coerce_allow_set(adapter_allow_from)
             authorized = user_id in allowed or "*" in allowed
+            if not authorized and source.chat_type == "dm" and self._should_pass_unauthorized_dm_for_pairing(source):
+                return True
         # Instance-level override only (tests): the class method _is_callback_user_authorized is for
         # inline buttons and must not become a user-id-only shortcut for real messages.
         if authorized is None:
@@ -886,27 +893,31 @@ class TelegramAdapter(BasePlatformAdapter):
             auth_fn = self._legacy_runner_auth_fn()
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
-                # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if not self._telegram_auth_env_configured():
-                    return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,
                     thread_id=source.thread_id) if has_callback else None
                 if decision is not None:
                     authorized = decision
+                elif has_callback:
+                    authorized = False
                 elif auth_fn is not None:
                     try:
                         authorized = bool(auth_fn(source))
                     except Exception:
-                        logger.debug("[Telegram] Falling back to env-only auth for user %s", user_id, exc_info=True)
+                        logger.debug("[Telegram] Message authorization failed for user %s", user_id, exc_info=True)
+                        authorized = False
         if authorized is None:
             authorized = self._env_allowlist_decision(user_id)
             if authorized is None:
                 return True
         if authorized:
             return True
-        # Unauthorized DM the gateway would pair: forward so pairing can run.
-        return self._should_pass_unauthorized_dm_for_pairing(source)
+        if authorized is False:
+            return False
+        # An explicit adapter pairing override is the only intake exception.
+        if self.config.extra.get("unauthorized_dm_behavior") == "pair":
+            return self._should_pass_unauthorized_dm_for_pairing(source)
+        return False
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -4244,12 +4255,48 @@ class TelegramAdapter(BasePlatformAdapter):
         await query.answer(text=denial_text)
         return False
 
+    async def _handle_budget_authorization_callback(self, query) -> bool:
+        """Process a budget callback before any ordinary message/LLM path."""
+        handler = getattr(self, "_budget_authorization_handler", None)
+        if not callable(handler):
+            await query.answer(text="Authorization unavailable.")
+            return True
+        parts = str(getattr(query, "data", "")).split(":", 2)
+        if len(parts) != 3 or parts[0] != "ba" or parts[2] not in {"a", "d"}:
+            await query.answer(text="Invalid authorization callback.")
+            return True
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        principal = {
+            "authenticated": True, "authentication_source": "gateway_adapter",
+            "subject": str(getattr(user, "id", "")), "platform": "telegram",
+            "chat_id": str(getattr(chat, "id", "")),
+            "chat_type": str(getattr(chat, "type", "")),
+            "thread_id": str(getattr(message, "message_thread_id", "") or ""),
+        }
+        try:
+            result = await handler(
+                {"callback_token": parts[1], "approved": parts[2] == "a"}, principal
+            )
+            text = result if isinstance(result, str) else (result or {}).get(
+                "message", "Authorization processed."
+            )
+        except Exception:
+            logger.info("Telegram budget authorization denied or unavailable")
+            text = "Authorization denied, expired, consumed, or invalid."
+        await query.answer(text=str(text)[:200])
+        return True
+
     async def _handle_callback_query(self, update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
         if not query or not query.data:
             return
         data = query.data
+        if data.startswith("ba:"):
+            await self._handle_budget_authorization_callback(query)
+            return
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (

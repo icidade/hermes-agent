@@ -144,12 +144,12 @@ For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-ho
 
 ## Cost & Context Governance
 
-Hermes can attach a governance envelope to expensive work so it classifies the request, budgets model/tool usage, preserves a QA reserve, and checkpoints partial handoffs.
+Hermes can attach a governance envelope to expensive work so it classifies the request, budgets model/tool usage, preserves a QA reserve, and checkpoints partial handoffs. See [Cost & Context Governance](/user-guide/features/cost-context-governance) for the lifecycle and artifact model.
 
 ```yaml
 cost_context_governance:
-  mode: observe                    # disabled | observe | enforce
-  workspace_dir: engagements
+  mode: disabled                   # disabled | observe | enforce
+  workspace_dir: engagements       # relative to the active profile home
   default_profile: conversational
   force_for_profiles: [chief-of-staff]
   engagement_keywords:
@@ -170,45 +170,96 @@ cost_context_governance:
     same_error_repeats: 3
     no_progress_iterations: 4
     timeout_checkpoint_seconds: 30
+    logical_call_max_preflights: 8
+    logical_call_max_compactions: 4
+    logical_call_min_progress_tokens: 64
+    logical_call_min_progress_ratio: 0.02
   profiles:
     conversational:
       total_model_calls: 3
-      tool_invocations: 6
+      calls_per_agent: 3
+      calls_per_delegated_task: 0
+      input_tokens: 6000
+      output_tokens: 3000
       total_tokens: 9000
+      context_tokens_per_request: 4500
+      wall_clock_seconds: 90
+      tool_invocations: 4
+      retries: 1
       delegation_count: 0
+      iterations_without_progress: 2
       qa_reserve_ratio: 0.0
     bounded:
-      total_model_calls: 6
-      tool_invocations: 15
-      total_tokens: 26000
+      total_model_calls: 5
+      calls_per_agent: 4
+      calls_per_delegated_task: 2
+      input_tokens: 12000
+      output_tokens: 6000
+      total_tokens: 18000
+      context_tokens_per_request: 9000
+      wall_clock_seconds: 180
+      tool_invocations: 10
+      retries: 2
       delegation_count: 1
+      iterations_without_progress: 3
       qa_reserve_ratio: 0.10
     standard_engagement:
       total_model_calls: 8
+      calls_per_agent: 6
+      calls_per_delegated_task: 5
+      input_tokens: 24000
+      output_tokens: 12000
       tool_invocations: 25
       total_tokens: 36000
+      context_tokens_per_request: 12000
+      wall_clock_seconds: 300
+      retries: 4
       delegation_count: 3
+      iterations_without_progress: 4
       qa_reserve_ratio: 0.20
     deep_engagement:
       total_model_calls: 16
-      tool_invocations: 50
-      total_tokens: 84000
-      delegation_count: 4
+      calls_per_agent: 10
+      calls_per_delegated_task: 8
+      input_tokens: 48000
+      output_tokens: 24000
+      tool_invocations: 40
+      total_tokens: 72000
+      context_tokens_per_request: 18000
+      wall_clock_seconds: 600
+      retries: 5
+      delegation_count: 6
+      iterations_without_progress: 5
       qa_reserve_ratio: 0.25
-  role_toolsets:
-    chief: [delegation, todo, session_search, file, search, skills, browser, web]
-    sme: [file, search, terminal, web, browser]
-    qa: [file, search, terminal, web, browser, session_search]
+    custom:
+      total_model_calls: 8
+      calls_per_agent: 6
+      calls_per_delegated_task: 5
+      input_tokens: 24000
+      output_tokens: 12000
+      total_tokens: 36000
+      context_tokens_per_request: 12000
+      wall_clock_seconds: 300
+      tool_invocations: 25
+      retries: 4
+      delegation_count: 3
+      iterations_without_progress: 4
+      qa_reserve_ratio: 0.20
+  role_toolsets: {}                 # empty by default; configure to restrict delegated children
 ```
 
 Notes:
 
-- `observe` writes the engagement artifacts and telemetry without aggressively blocking work.
-- `enforce` can pause or hard-stop when projected usage would consume QA reserve or when a lane stalls.
-- `profiles` define the envelope for model calls, tokens, tool invocations, retries, delegated-task calls, and wall-clock time.
-- `role_toolsets` is applied to delegated children before the child agent starts, so first-turn tool access is already narrowed.
+- The code defaults are `mode: disabled`, `workspace_dir: engagements`, and `default_profile: conversational`.
+- `force_for_profiles` is a `list[str]`, defaulting to `["chief-of-staff"]`. A profile in this list does not force every request into engagement; it makes a security/miniciso request an `engagement` using `standard_engagement` when no earlier classification rule matched.
+- `engagement_keywords` is a `list[str]`, defaulting to `["miniciso", "security", "assessment", "review", "threat model", "appsec", "bug bounty"]`. Hermes lowercases the message and checks whether any configured keyword occurs as a substring; a match selects `engagement` with `standard_engagement`.
+- Classification precedence is: delegated child inheritance; `engagement_keywords`; `force_for_profiles` for messages containing `security` or `miniciso`; generic markers `review`, `assessment`, `investigate`, or `analyze` (selecting `bounded`); otherwise `conversational`. For example, `engagement_keywords: ["audit"]` makes `"audit the config"` an engagement, while `force_for_profiles: []` removes only the profile-based security/miniciso fallback.
+- The request classes are `conversational`, `bounded`, and `engagement`; the built-in budget profile keys are `conversational`, `bounded`, `standard_engagement`, `deep_engagement`, and `custom`.
+- `profiles` accept `total_model_calls`, `calls_per_agent`, `calls_per_delegated_task`, `input_tokens`, `output_tokens`, `total_tokens`, `context_tokens_per_request`, `wall_clock_seconds`, `tool_invocations`, `retries`, `delegation_count`, `iterations_without_progress`, and `qa_reserve_ratio`.
+- `role_toolsets` defaults to an empty mapping. When configured, its role allowlist is applied to delegated children before construction.
+- `observe` records lifecycle state and remains informative; `enforce` can pause or hard-stop before provider/tool execution when the state is not trustworthy.
 
-See [Cost & Context Governance](/user-guide/features/cost-context-governance) for the full behavior and artifact model.
+For the actual artifact paths, request lifecycle, authorization boundary, and safe rollout procedure, see [Cost & Context Governance](/user-guide/features/cost-context-governance).
 
 ### Provider Timeouts
 

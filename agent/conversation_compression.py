@@ -1789,22 +1789,38 @@ def check_compression_model_feasibility(agent: Any) -> None:
             get_text_auxiliary_client,
         )
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+        # An in-turn governed callable is already the selected auxiliary provider.  Do
+        # not re-resolve the process-wide auxiliary route here: that preflight runs
+        # before the actual governed call and used to discard the injected runtime as
+        # "no provider", forcing the legitimate static fallback.  The callable still
+        # reaches ContextCompressor._call_governed_compression_llm, where its normal
+        # viability, lock, retry, media and accounting pipeline remains authoritative.
+        _aux_runtime = getattr(agent.context_compressor, "_aux_runtime", lambda: {})()
+        _runtime_callable = _aux_runtime.get("aux_llm_callable") if isinstance(_aux_runtime, dict) else None
+        _runtime_injected = callable(_runtime_callable)
         # Provider may be "auto"; fall back to the client's base_url hostname so the
         # user can tell where the compression model is actually called.
-        try:
-            _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
-        except Exception:
-            _aux_cfg_provider = ""
-        client, aux_model = get_text_auxiliary_client("compression", main_runtime=agent._current_main_runtime())
-        if client is None or not aux_model:
-            fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                "compression", _aux_cfg_provider
-            )
-            if fb_client is not None and fb_model:
-                client, aux_model = fb_client, fb_model
-                if "(" in fb_label and fb_label.endswith(")"):
-                    _aux_cfg_provider = fb_label.rsplit("(", 1)[1][:-1]
-        if client is None or not aux_model:
+        if _runtime_injected:
+            _aux_cfg_provider = str(_aux_runtime.get("provider") or getattr(agent, "provider", "") or "")
+            client = None
+            aux_model = getattr(agent.context_compressor, "summary_model", "") or getattr(
+                agent.context_compressor, "model", ""
+            ) or getattr(agent, "model", "") or "injected-runtime"
+        else:
+            try:
+                _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
+            except Exception:
+                _aux_cfg_provider = ""
+            client, aux_model = get_text_auxiliary_client("compression", main_runtime=agent._current_main_runtime())
+            if client is None or not aux_model:
+                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
+                    "compression", _aux_cfg_provider
+                )
+                if fb_client is not None and fb_model:
+                    client, aux_model = fb_client, fb_model
+                    if "(" in fb_label and fb_label.endswith(")"):
+                        _aux_cfg_provider = fb_label.rsplit("(", 1)[1][:-1]
+        if not _runtime_injected and (client is None or not aux_model):
             if _aux_cfg_provider and _aux_cfg_provider != "auto":
                 msg = (
                     "⚠ Configured auxiliary compression provider "
@@ -1821,7 +1837,9 @@ def check_compression_model_feasibility(agent: Any) -> None:
             agent._emit_status(msg)
             logger.warning("No auxiliary LLM provider for compression — summaries will be unavailable.")
             return
-        aux_base_url = str(getattr(client, "base_url", ""))
+        aux_base_url = str(getattr(client, "base_url", "")) if client is not None else str(
+            getattr(agent, "base_url", "") or ""
+        )
         # client.api_key may be a callable (Entra bearer); the resolver only needs a key
         # for live catalogue probes, so pass "" rather than mint a JWT for a lookup.
         _raw_aux_key = getattr(client, "api_key", "")
@@ -1832,7 +1850,13 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")
         )
         _aux_cfg_ctx = getattr(agent, "_aux_compression_context_length_config", None)
-        if _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
+        if _runtime_injected:
+            # The injected callable has no resolver-owned client metadata.  Its
+            # connected compressor is the viability source, and this preserves the
+            # compressor's configured context window without inventing a duplicate
+            # provider/model configuration.
+            aux_context = int(agent.context_compressor.context_length)
+        elif _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
             # Same model on the same route: reuse the main model's already-resolved window (which honours
             # model.context_length / provider pins). Re-resolving from scratch lost the pin and auto-lowered
             # the session threshold to a catch-all catalog value (#89500, #45519).

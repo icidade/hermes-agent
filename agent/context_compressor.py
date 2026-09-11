@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
@@ -43,6 +43,48 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+@dataclass
+class CompressionAuxCallResult:
+    response: Any = None
+    request_id: str = ""
+    logical_call_id: str = ""
+    attempt_id: str = ""
+    request_kind: str = "compaction"
+    dispatch_status: str = "not_dispatched"
+    state: str = "untracked"
+    usage: Dict[str, Any] | None = None
+    usage_missing: bool = False
+    termination_reason: str | None = None
+    released_reason: str | None = None
+    error_message: str | None = None
+
+
+class CompressionGovernanceStop(RuntimeError):
+    def __init__(self, message: str, *, result: CompressionAuxCallResult | None = None):
+        super().__init__(message)
+        self.result = result
+
+
+_COMPRESSION_AUX_RUNTIME: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "hermes_compression_aux_runtime", default=None
+)
+_RUNTIME_UNSET = object()
+
+
+@contextlib.contextmanager
+def compression_aux_runtime(**overrides: Any):
+    current = _COMPRESSION_AUX_RUNTIME.get() or {}
+    merged = dict(current)
+    for key, value in overrides.items():
+        if value is not _RUNTIME_UNSET:
+            merged[key] = value
+    token = _COMPRESSION_AUX_RUNTIME.set(merged)
+    try:
+        yield merged
+    finally:
+        _COMPRESSION_AUX_RUNTIME.reset(token)
 
 
 # Summary-route pin lives in a ContextVar (not on the shared compressor) so the retry after a stalled
@@ -3217,6 +3259,89 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _aux_runtime(self) -> Dict[str, Any]:
+        runtime = _COMPRESSION_AUX_RUNTIME.get()
+        bound = getattr(self, "_bound_aux_runtime", None)
+        merged = dict(bound) if isinstance(bound, dict) else {}
+        if isinstance(runtime, dict):
+            merged.update(runtime)
+        return merged
+
+    def bind_auxiliary_runtime(self, **overrides: Any):
+        @contextlib.contextmanager
+        def _bound():
+            previous = getattr(self, "_bound_aux_runtime", None)
+            current = dict(previous) if isinstance(previous, dict) else {}
+            current.update({key: value for key, value in overrides.items() if value is not _RUNTIME_UNSET})
+            self._bound_aux_runtime = current
+            try:
+                with compression_aux_runtime(**overrides):
+                    yield current
+            finally:
+                self._bound_aux_runtime = previous
+        return _bound()
+
+    @staticmethod
+    def _aux_usage(response: Any) -> Any:
+        return response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+
+    def _call_governed_compression_llm(self, *, call_kwargs: Dict[str, Any]) -> CompressionAuxCallResult:
+        runtime = self._aux_runtime()
+        controller = runtime.get("governance_controller")
+        logical_call_id = str(runtime.get("logical_call_id") or "")
+        override = runtime.get("aux_llm_callable")
+        llm = override if callable(override) else call_llm
+        if controller is None or not logical_call_id:
+            if runtime.get("governance_required"):
+                result = CompressionAuxCallResult(
+                    logical_call_id=logical_call_id,
+                    termination_reason="compaction_governance_state_unavailable",
+                    error_message="Compression auxiliary call blocked by governance.",
+                )
+                raise CompressionGovernanceStop(result.error_message, result=result)
+            return CompressionAuxCallResult(response=llm(**call_kwargs))
+        identity = controller.allocate_request_identity(
+            logical_call_id=logical_call_id, request_kind="compaction",
+            request_label=str(runtime.get("request_label") or "compaction"),
+        )
+        request_id = identity["request_id"]
+        approx = max(1, int(estimate_messages_tokens_rough(call_kwargs.get("messages") or []) or 1))
+        decision = controller.before_model_call(
+            request_id=request_id, messages=list(call_kwargs.get("messages") or []),
+            # The auxiliary request has its own identity/accounting.  The
+            # primary loop count must not consume the auxiliary call slot.
+            approx_request_tokens=approx, api_call_count=0,
+            logical_call_id=logical_call_id, attempt_id=identity["attempt_id"], request_kind="compaction",
+        )
+        if not decision.get("allowed") or decision.get("stop") or decision.get("pause"):
+            with contextlib.suppress(Exception):
+                controller.finalize_request(request_id, "blocked", decision.get("termination_reason") or "compaction_governance_blocked")
+            result = CompressionAuxCallResult(
+                request_id=request_id, logical_call_id=logical_call_id, attempt_id=identity["attempt_id"],
+                termination_reason=decision.get("termination_reason") or "compaction_governance_blocked",
+                error_message=decision.get("message") or "Compression auxiliary call blocked by governance.",
+            )
+            raise CompressionGovernanceStop(result.error_message, result=result)
+        try:
+            controller.record_dispatch(request_id)
+            response = llm(**call_kwargs)
+            usage = self._aux_usage(response)
+            canonical = controller.reconcile_usage(
+                request_id, usage, duration_seconds=0.0,
+                approx_request_tokens=approx, response_text="",
+            )
+            controller.finalize_request(request_id, "completed", "compaction_model_call_completed")
+            return CompressionAuxCallResult(
+                response=response, request_id=request_id, logical_call_id=logical_call_id,
+                attempt_id=identity["attempt_id"], dispatch_status="dispatched", state="completed",
+                usage=canonical, usage_missing=usage is None,
+                termination_reason="compaction_model_call_completed",
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                controller.account_dispatched_request_failure(request_id, reason="provider_error", error_message=exc)
+            raise
+
     def _call_summary_llm(self, prompt: str, prompt_started_at: float) -> str:
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
@@ -3247,7 +3372,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         try:
             # Compression is atomic: shield the summary call from gateway interrupts. Re-entrant.
             with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                response = self._call_governed_compression_llm(call_kwargs=call_kwargs).response
         finally:
             route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
             _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""

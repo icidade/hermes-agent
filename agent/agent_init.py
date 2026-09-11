@@ -1086,11 +1086,16 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         # ordinary agent construction.
         pass
 
-    import model_tools
-    agent.tools = model_tools.get_tool_definitions(
+    agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=_enabled_toolsets_runtime, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    if agent.cost_context_governance is not None:
+        try:
+            agent.tools = agent.cost_context_governance.filter_tool_schemas(agent.tools or [])
+        except Exception as exc:
+            _ra().logger.warning("Governance tool schema filtering failed closed: %s", type(exc).__name__)
+            agent.tools = []
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     if agent.cost_context_governance is not None:
@@ -2260,6 +2265,8 @@ def init_agent(
         setattr(agent, _name, _params[_name])
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
+    agent._governance_owner_identity_trusted = bool(gateway_session_key and user_id and platform)
+    agent._governance_callback_capability = object() if agent._governance_owner_identity_trusted else None
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

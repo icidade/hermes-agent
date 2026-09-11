@@ -1048,6 +1048,9 @@ class GatewayAdapterLifecycleMixin:
         adapter.set_authorization_check(
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
+        setter = getattr(adapter, "set_budget_authorization_handler", None)
+        if callable(setter):
+            setter(self._make_budget_authorization_handler())
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
 
@@ -1083,6 +1086,35 @@ class GatewayAdapterLifecycleMixin:
         # Secondary adapters carry their profile so prune paths namespace topic bindings correctly.
         # See #76423.
         adapter._hermes_profile_name = profile_name
+
+    def _make_budget_authorization_handler(self, profile_name: str | None = None):
+        """Bridge authenticated platform callbacks to the scoped cached controller."""
+        async def _handler(callback: dict, principal: dict):
+            chat_type = str(principal.get("chat_type") or "dm").strip().lower() or "dm"
+            if chat_type == "private":
+                chat_type = "dm"
+            elif chat_type == "supergroup":
+                chat_type = "forum" if principal.get("thread_id") is not None else "group"
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=str(principal.get("chat_id") or ""), chat_type=chat_type,
+                user_id=str(principal.get("subject") or ""),
+                thread_id=str(principal.get("thread_id") or "") or None,
+                profile=profile_name,
+            )
+            cached = getattr(self, "_agent_cache", {}).get(self._session_key_for_source(source))
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            controller = getattr(agent, "cost_context_governance", None) if agent else None
+            if controller is None:
+                raise RuntimeError("authorization session unavailable")
+            scoped_principal = {**principal, "profile": controller.profile_name,
+                                "engagement_id": controller.engagement_id, "task_id": controller.task_id}
+            result = controller.submit_budget_authorization_callback(
+                callback_token=str(callback["callback_token"]), principal=scoped_principal,
+                approved=bool(callback["approved"]), reason="Telegram authenticated callback decision",
+            )
+            return {"status": result.get("status"), "message": "Autorização processada; retomada pendente."}
+        return _handler
 
     async def _secondary_reconnect_attempt(self, profile_name: str, platform: Platform):
         """One scoped attempt to rebuild+connect a secondary adapter → ``(adapter, success)``;

@@ -53,6 +53,7 @@ from agent.turn_request_assembly import assemble_api_request
 from agent.turn_response_check import check_api_response
 from agent.turn_response_intake import normalize_model_response
 from agent.turn_tool_round import run_tool_round
+from agent.context_compressor import CompressionGovernanceStop
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches
@@ -1489,7 +1490,7 @@ def _run_conversation_turn(
                 user_message=_ctx.user_message,
                 system_message=system_message or "",
                 messages=_ctx.messages,
-                task_id=_ctx.effective_task_id,
+                task_id=(getattr(agent, "_governance_resume_task_id", None) or _ctx.effective_task_id),
             )
         except Exception:
             pass
@@ -1536,37 +1537,115 @@ def _run_conversation_turn(
         if _pg.action == "continue":
             continue
 
+        s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
         if governance is not None:
             try:
+                logical_call_id = getattr(agent, "_governance_resume_logical_call_id", None) or f"{s.turn_id}:logical"
+                try:
+                    allocated = governance.allocate_request_identity(
+                        logical_call_id=logical_call_id, request_kind="primary", request_label=f"api:{s.api_call_count}"
+                    )
+                except Exception:
+                    if governance.should_enforce():
+                        raise
+                    allocated = {"logical_call_id": logical_call_id, "attempt_id": f"{logical_call_id}:observe", "request_id": s.api_request_id}
+                s.api_request_id = agent._current_api_request_id = allocated["request_id"]
                 _gov_decision = governance.before_model_call(
-                    messages=s.api_messages or s.messages,
+                    request_id=s.api_request_id,
+                    messages=s.messages,
                     approx_request_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
                     api_call_count=s.api_call_count,
+                    logical_call_id=allocated["logical_call_id"],
+                    attempt_id=allocated["attempt_id"],
+                    request_kind="primary",
                 )
-                if _gov_decision.get("compact_context"):
-                    s.messages, s.active_system_prompt = agent._compress_context(
-                        s.messages,
-                        system_message,
-                        approx_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
-                        task_id=s.effective_task_id,
-                        focus_topic="cost-context-governance",
-                    )
-                    s.conversation_history = None
-                    continue
-                if _gov_decision.get("pause") or _gov_decision.get("stop"):
-                    s.final_response = _gov_decision.get("message") or (
-                        "Execução pausada pela governança de custo/contexto."
+                _gov_decision = governance.validate_decision(_gov_decision, request_id=s.api_request_id)
+                if not _gov_decision.get("allowed") and not _gov_decision.get("compact_context"):
+                    s.final_response = _gov_decision.get("message") or str(
+                        _gov_decision.get("termination_reason") or _gov_decision.get("reason")
+                        or "Execução pausada pela governança de custo/contexto."
                     )
                     s.failed = False
-                    s._turn_exit_reason = "cost_context_governance_pause"
+                    s._turn_exit_reason = _gov_decision.get("termination_reason") or "cost_context_governance_pause"
                     break
-            except Exception:
-                pass
+                if _gov_decision.get("compact_context"):
+                    _pre_compaction_messages = list(s.messages)
+                    with agent.context_compressor.bind_auxiliary_runtime(
+                        governance_controller=governance,
+                        logical_call_id=allocated["logical_call_id"],
+                        api_call_count=s.api_call_count,
+                        request_label="request",
+                        governance_required=True,
+                    ):
+                        s.messages, s.active_system_prompt = agent._compress_context(
+                            s.messages, system_message,
+                            approx_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
+                            task_id=s.effective_task_id, focus_topic="cost-context-governance",
+                        )
+                    s.conversation_history = None
+                    try:
+                        governance.record_compaction_event(
+                            reason="governance_warning_compaction",
+                            pre_messages=_pre_compaction_messages,
+                            post_messages=s.messages,
+                            system_message=s.active_system_prompt or "",
+                        )
+                        compaction_result = governance.record_logical_compaction_result(
+                            logical_call_id=allocated["logical_call_id"], attempt_id=allocated["attempt_id"],
+                            request_id=s.api_request_id, pre_messages=_pre_compaction_messages,
+                            post_messages=s.messages,
+                        )
+                    except Exception:
+                        governance._dispatch_failure_latched = True
+                        s.final_response = "Execução pausada pela governança de custo/contexto por falha contábil de compactação."
+                        s.failed = True
+                        s._turn_exit_reason = "governance_logical_compaction_persistence_error"
+                        break
+                    if isinstance(compaction_result, dict) and compaction_result.get("stop"):
+                        s.final_response = compaction_result.get("message") or "Execução pausada pela governança de custo/contexto."
+                        s.failed = False
+                        s._turn_exit_reason = compaction_result.get("termination_reason") or "cost_context_governance_hard_stop"
+                        break
+                    governance.release_request(s.api_request_id, "governance_warning_compaction")
+                    continue
+                if _gov_decision.get("reservation_id"):
+                    governance.record_dispatch(s.api_request_id)
+            except CompressionGovernanceStop:
+                s.final_response = "Execução pausada pela governança de custo/contexto durante a compactação."
+                s.failed = True
+                s._turn_exit_reason = "cost_context_governance_hard_stop"
+                break
+            except RuntimeError as exc:
+                if str(exc).startswith("invalid governance decision:"):
+                    s.final_response = str(exc)
+                    s.failed = False
+                    s._turn_exit_reason = "invalid_governance_decision"
+                    break
+                if governance is not None and s.api_request_id:
+                    try:
+                        governance.handle_dispatch_persistence_failure(s.api_request_id, exc)
+                    except Exception:
+                        pass
+                s.final_response = "Execução pausada pela governança de custo/contexto."
+                s.failed = True
+                s._turn_exit_reason = "governance_dispatch_persistence_error"
+                logger.warning("Governance preflight failed closed: %s", type(exc).__name__, exc_info=True)
+                break
+            except Exception as exc:
+                if governance is not None and s.api_request_id:
+                    try:
+                        governance.handle_dispatch_persistence_failure(s.api_request_id, exc)
+                    except Exception:
+                        pass
+                s.final_response = "Execução pausada pela governança de custo/contexto."
+                s.failed = True
+                s._turn_exit_reason = "governance_dispatch_persistence_error"
+                logger.warning("Governance preflight failed closed: %s", type(exc).__name__, exc_info=True)
+                break
         _run_phase(announce_api_call, agent, s)
 
         s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
-        s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 
         early_result = _run_api_retry_loop(agent, s)
         if early_result is not None:
@@ -1576,6 +1655,7 @@ def _run_conversation_turn(
             try:
                 governance.record_model_usage(
                     getattr(s.response, "usage", None),
+                    request_id=s.api_request_id,
                     duration_seconds=float(s.api_duration or 0.0),
                     retry_count=s.retry_count,
                     approx_request_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),

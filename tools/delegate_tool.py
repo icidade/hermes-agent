@@ -296,6 +296,7 @@ def _build_child_agent(
                 child_task_id=subagent_id,
                 requested_profile=getattr(parent_agent, "_governance_profile_key", None),
                 selected_agents=[effective_role],
+                governance_role=governance_role,
             )
             seed["selected_agents"] = [effective_role]
             setattr(child, "_governance_seed", seed)
