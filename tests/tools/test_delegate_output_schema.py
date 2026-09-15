@@ -13,6 +13,7 @@ ONLY, zero code/prompt text copied (proprietary).
 """
 
 import json
+import logging
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +98,47 @@ class TestCoerceOutputSchema:
         schema, err = coerce_output_schema({"type": 42})
         assert schema is None
         assert err
+
+    def test_missing_validator_rejects_schema_without_leaking_schema_or_import_details(self):
+        canary_schema = {"type": "object", "properties": {"secret_canary": {"type": "string"}}}
+        with patch("builtins.__import__", side_effect=_deny_jsonschema_import()):
+            schema, err = coerce_output_schema(canary_schema)
+        assert schema is None
+        assert err == "output_schema validation is unavailable; jsonschema is required."
+        assert "secret_canary" not in err
+        assert "ImportError" not in err
+
+
+def _deny_jsonschema_import():
+    real_import = __import__
+
+    def denied(name, *args, **kwargs):
+        if name == "jsonschema.validators":
+            raise ImportError("IMPORT_ERROR_CANARY: jsonschema missing")
+        return real_import(name, *args, **kwargs)
+
+    return denied
+
+
+class TestMissingValidatorFailClosed:
+    def test_validate_output_fails_explicitly_without_accepting_payload(self):
+        payload = '{"secret_payload_canary": true}'
+        with patch("builtins.__import__", side_effect=_deny_jsonschema_import()):
+            ok, errors = validate_output(payload, ADDRESS_SCHEMA)
+        assert ok is False
+        assert errors == ["output_schema validation is unavailable; jsonschema is required."]
+        assert "secret_payload_canary" not in " ".join(errors)
+        assert "IMPORT_ERROR_CANARY" not in " ".join(errors)
+
+    def test_missing_validator_does_not_log_schema_payload_or_import_error(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            with patch("builtins.__import__", side_effect=_deny_jsonschema_import()):
+                coerce_output_schema({"secret_schema_canary": True})
+                validate_output('{"secret_payload_canary": true}', ADDRESS_SCHEMA)
+        logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "secret_schema_canary" not in logs
+        assert "secret_payload_canary" not in logs
+        assert "IMPORT_ERROR_CANARY" not in logs
 
 
 class TestPromptPlumbing:
@@ -373,6 +415,59 @@ class TestDelegateTaskDispatch:
         payload = json.loads(out)
         assert payload.get("error")
         assert "output_schema" in payload["error"]
+
+    def test_missing_validator_blocks_dispatch_before_child_creation(self):
+        child_builder = MagicMock()
+        with (
+            patch("builtins.__import__", side_effect=_deny_jsonschema_import()),
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value={
+                    "provider": None,
+                    "model": None,
+                    "base_url": None,
+                    "api_key": None,
+                    "api_mode": None,
+                },
+            ),
+            patch("tools.delegate_tool._build_child_preserving_parent_tools", child_builder),
+        ):
+            out = delegate_task(
+                tasks=[{"goal": "Produce a structured result", "output_schema": {"type": "object"}}],
+                parent_agent=_make_mock_parent(),
+            )
+        payload = json.loads(out)
+        assert "output_schema validation is unavailable; jsonschema is required." in payload["error"]
+        assert child_builder.call_count == 0
+        assert "IMPORT_ERROR_CANARY" not in out
+
+    def test_missing_validator_keeps_schema_less_dispatch_allowed(self):
+        child = _StubChild(['{"city": "Rio"}'])
+        builder = MagicMock(return_value=child)
+        with (
+            patch("builtins.__import__", side_effect=_deny_jsonschema_import()),
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value={
+                    "provider": None,
+                    "model": None,
+                    "base_url": None,
+                    "api_key": None,
+                    "api_mode": None,
+                },
+            ),
+            patch("tools.delegate_tool._build_child_preserving_parent_tools", builder),
+        ):
+            out = delegate_task(
+                tasks=[{"goal": "Produce an unstructured result without a schema"}],
+                parent_agent=_make_mock_parent(),
+            )
+        payload = json.loads(out)
+        assert payload["results"][0]["status"] == "completed"
+        assert "schema_valid" not in payload["results"][0]
+        assert builder.call_count == 1
 
     def test_child_receives_contract_and_schema_attr(self):
         """The built child carries the schema attr and its context gains

@@ -1062,6 +1062,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent.cost_context_governance = None
     agent._governance_role = "chief" if getattr(agent, "_delegate_depth", 0) == 0 else "sme"
     _enabled_toolsets_runtime = enabled_toolsets
+    _gov_cfg = {}
     try:
         from hermes_cli.config import load_config as _load_gov_cfg
         from agent.cost_context_governance import build_governance_controller
@@ -1082,9 +1083,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
             list(_effective_enabled_toolsets) if _effective_enabled_toolsets is not None else None
         )
     except Exception:
-        # Governance is optional; a malformed/absent config must not prevent
-        # ordinary agent construction.
-        pass
+        # An explicitly enabled governance mode must not silently lose its
+        # storage boundary; absent or disabled configuration remains optional.
+        if (_gov_cfg or {}).get("mode") == "enforce":
+            raise RuntimeError("Governança não conseguiu resolver o storage decisório; provider bloqueado.") from None
 
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=_enabled_toolsets_runtime, disabled_toolsets=disabled_toolsets,

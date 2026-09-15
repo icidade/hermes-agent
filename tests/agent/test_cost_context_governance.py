@@ -102,6 +102,20 @@ def test_existing_budget_artifact_is_not_treated_as_missing(tmp_path, contents):
         budget.update(lambda data: data)
 
 
+def test_workspace_resolver_failure_does_not_use_implicit_hermes_home(tmp_path, monkeypatch):
+    agent = _make_agent()
+    config = GovernanceConfig.from_mapping({"mode": "enforce", "workspace_dir": "engagements"})
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "profile-a")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", MagicMock(side_effect=OSError("resolver unavailable")))
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", MagicMock(side_effect=OSError("resolver unavailable")))
+
+    with pytest.raises(OSError, match="resolver unavailable"):
+        GovernanceController(agent, config)
+
+    assert not any(path.name == "." + "hermes" for path in tmp_path.iterdir())
+
+
 def test_budget_missing_field_and_invalid_decisional_type_fail_closed(tmp_path, monkeypatch):
     controller, _agent = _make_controller(tmp_path, monkeypatch, mode="enforce")
     controller.begin_turn(user_message="MiniCISO security review", system_message="system", messages=[], task_id="shape")

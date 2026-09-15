@@ -15,6 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+_VALIDATOR_UNAVAILABLE_ERROR = "output_schema validation is unavailable; jsonschema is required."
+_INVALID_SCHEMA_ERROR = "output_schema is not a valid JSON Schema."
+
 
 def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """``(schema, None)`` when usable, ``(None, error)`` when not; ``None`` input
@@ -35,10 +38,12 @@ def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[s
         from jsonschema.validators import validator_for  # type: ignore[import-untyped]
         validator_for(raw).check_schema(raw)
     except ImportError:
-        # Degrade to accepting the dict as-is so delegation still works without jsonschema.
+        # A requested schema must never reach a child without meta-validation.
         logger.debug("jsonschema unavailable; skipping output_schema meta-validation")
+        return None, _VALIDATOR_UNAVAILABLE_ERROR
     except Exception as exc:
-        return None, f"output_schema is not a valid JSON Schema: {exc}"
+        del exc
+        return None, _INVALID_SCHEMA_ERROR
     return raw, None
 
 
@@ -88,10 +93,14 @@ def validate_output(text: str, schema: Dict[str, Any]) -> Tuple[bool, List[str]]
     try:
         from jsonschema.validators import validator_for  # type: ignore[import-untyped]
     except ImportError:
-        logger.debug("jsonschema unavailable; accepting parsed JSON without validation")
-        return True, []
-    validator = validator_for(schema)(schema)
-    errors = sorted(validator.iter_errors(parsed), key=lambda e: list(e.absolute_path))
+        logger.debug("jsonschema unavailable; rejecting output_schema validation")
+        return False, [_VALIDATOR_UNAVAILABLE_ERROR]
+    try:
+        validator = validator_for(schema)(schema)
+        errors = sorted(validator.iter_errors(parsed), key=lambda e: list(e.absolute_path))
+    except Exception as exc:
+        del exc
+        return False, [_INVALID_SCHEMA_ERROR]
     rendered = [  # bound error volume for the retry prompt
         "$" + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in err.absolute_path) + f": {err.message}"
         for err in errors[:10]]

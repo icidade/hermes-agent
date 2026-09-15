@@ -580,20 +580,16 @@ class GovernanceController:
         if cfg_path and ("/profiles/" in cfg_path or "\\profiles\\" in cfg_path):
             profile_dir = Path(cfg_path).resolve().parent
             return profile_dir / str(self.config.workspace_dir)
-        try:
-            from hermes_constants import get_default_hermes_root, get_hermes_home
+        from hermes_constants import get_default_hermes_root, get_hermes_home
 
-            hermes_home = get_hermes_home().resolve()
-            default_root = get_default_hermes_root().resolve()
-            profile_name = (self.profile_name or "").strip()
-            if profile_name and hermes_home.parent.name == "profiles":
-                return hermes_home.parent / profile_name / str(self.config.workspace_dir)
-            if profile_name and (default_root / "profiles" / profile_name).exists():
-                return default_root / "profiles" / profile_name / str(self.config.workspace_dir)
-            return hermes_home / str(self.config.workspace_dir)
-        except Exception:
-            home = Path(os.path.expanduser("~/.hermes"))
-            return home / str(self.config.workspace_dir)
+        hermes_home = get_hermes_home().resolve()
+        default_root = get_default_hermes_root().resolve()
+        profile_name = (self.profile_name or "").strip()
+        if profile_name and hermes_home.parent.name == "profiles":
+            return hermes_home.parent / profile_name / str(self.config.workspace_dir)
+        if profile_name and (default_root / "profiles" / profile_name).exists():
+            return default_root / "profiles" / profile_name / str(self.config.workspace_dir)
+        return hermes_home / str(self.config.workspace_dir)
 
     def _raw_engagement_id_candidate(self) -> Optional[str]:
         seed = getattr(self.agent, "_governance_seed", None)
@@ -2717,7 +2713,7 @@ class GovernanceController:
                 duration_seconds=duration_seconds,
                 retry_count=retry_count,
                 response_text=response_text,
-                error_message=str(exc),
+                error_message=exc,
             )
             snapshot = self._root_snapshot()
             entry = ((snapshot.get("request_state") or {}).get(request_id) or {})

@@ -1617,7 +1617,7 @@ def _run_conversation_turn(
                 break
             except RuntimeError as exc:
                 if str(exc).startswith("invalid governance decision:"):
-                    s.final_response = str(exc)
+                    s.final_response = "Execução pausada pela governança de custo/contexto."
                     s.failed = False
                     s._turn_exit_reason = "invalid_governance_decision"
                     break
@@ -1629,7 +1629,7 @@ def _run_conversation_turn(
                 s.final_response = "Execução pausada pela governança de custo/contexto."
                 s.failed = True
                 s._turn_exit_reason = "governance_dispatch_persistence_error"
-                logger.warning("Governance preflight failed closed: %s", type(exc).__name__, exc_info=True)
+                logger.warning("Governance preflight failed closed: %s", type(exc).__name__)
                 break
             except Exception as exc:
                 if governance is not None and s.api_request_id:
@@ -1640,7 +1640,7 @@ def _run_conversation_turn(
                 s.final_response = "Execução pausada pela governança de custo/contexto."
                 s.failed = True
                 s._turn_exit_reason = "governance_dispatch_persistence_error"
-                logger.warning("Governance preflight failed closed: %s", type(exc).__name__, exc_info=True)
+                logger.warning("Governance preflight failed closed: %s", type(exc).__name__)
                 break
         _run_phase(announce_api_call, agent, s)
 

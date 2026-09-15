@@ -222,6 +222,27 @@ def test_schema_filter_failure_never_sends_unfiltered_tools(agent, monkeypatch):
             assert canary not in path.read_text(encoding="utf-8")
 
 
+def test_invalid_governance_decision_has_stable_public_error(agent, monkeypatch, caplog):
+    canary = (
+        "secret-governance-decision path=/absolute/private/state.json"
+        " url=https://example.invalid/decision?token=do-not-leak"
+    )
+    monkeypatch.setattr(agent.cost_context_governance, "_threshold_action", lambda _ratio: "allow")
+    monkeypatch.setattr(
+        GovernanceController,
+        "validate_decision",
+        MagicMock(side_effect=RuntimeError(f"invalid governance decision: {canary}")),
+    )
+    agent.client.chat.completions.create.return_value = _mock_response(content="must not run")
+
+    result = agent.run_conversation("security review")
+
+    assert agent.client.chat.completions.create.call_count == 0
+    assert result["final_response"] == "Execução pausada pela governança de custo/contexto."
+    assert canary not in json.dumps(result)
+    assert canary not in caplog.text
+
+
 @pytest.mark.parametrize("mode, expect_provider", [("enforce", False), ("observe", True)])
 def test_request_identity_failure_preserves_enforce_and_observe(mode, expect_provider, tmp_path, monkeypatch):
     canary = (
@@ -939,7 +960,7 @@ def test_enforce_invalid_decision_blocks_before_provider(tmp_path, monkeypatch, 
     result = agent.run_conversation("hello")
 
     assert result["completed"] is True
-    assert "invalid governance decision" in result["final_response"]
+    assert result["final_response"] == "Execução pausada pela governança de custo/contexto."
     assert agent.client.chat.completions.create.call_count == 0
 
 

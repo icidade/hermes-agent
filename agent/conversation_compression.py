@@ -1855,17 +1855,32 @@ def check_compression_model_feasibility(agent: Any) -> None:
             # connected compressor is the viability source, and this preserves the
             # compressor's configured context window without inventing a duplicate
             # provider/model configuration.
-            aux_context = int(agent.context_compressor.context_length)
+            _runtime_context = getattr(agent.context_compressor, "context_length", None)
+            aux_context = (
+                _runtime_context
+                if isinstance(_runtime_context, int) and not isinstance(_runtime_context, bool) and _runtime_context > 0
+                else None
+            )
         elif _aux_cfg_ctx is None and _aux_inherits_main_route(agent, aux_model, aux_base_url):
             # Same model on the same route: reuse the main model's already-resolved window (which honours
             # model.context_length / provider pins). Re-resolving from scratch lost the pin and auto-lowered
             # the session threshold to a catch-all catalog value (#89500, #45519).
-            aux_context = int(agent.context_compressor.context_length)
+            _main_context = getattr(agent.context_compressor, "context_length", None)
+            if isinstance(_main_context, int) and not isinstance(_main_context, bool) and _main_context > 0:
+                aux_context = _main_context
+            else:
+                aux_context = get_model_context_length(
+                    aux_model, base_url=aux_base_url, api_key=aux_api_key, config_context_length=_aux_cfg_ctx,
+                    provider=_aux_provider, custom_providers=agent._custom_providers,
+                )
         else:
             aux_context = get_model_context_length(
                 aux_model, base_url=aux_base_url, api_key=aux_api_key, config_context_length=_aux_cfg_ctx,
                 provider=_aux_provider, custom_providers=agent._custom_providers,
             )
+        if aux_context is None:
+            logger.debug("Skipping compression feasibility: auxiliary context length is not numeric")
+            return
         # Aux model must meet MINIMUM_CONTEXT_LENGTH like the main model, else it cannot summarise a full window.
         if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
             raise ValueError(

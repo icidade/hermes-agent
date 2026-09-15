@@ -40,3 +40,42 @@ def test_feasibility_check_inherits_main_window_when_aux_is_the_main_model(monke
     )
     cc.check_compression_model_feasibility(agent)
     assert lowered == []
+
+
+def test_feasibility_does_not_treat_synthetic_context_as_one_token(monkeypatch):
+    """A test double without a numeric main window must not become a 1-token route."""
+    import agent.auxiliary_client as aux
+    import agent.model_metadata as mm
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda task: ("auto", None, None, None, None))
+    monkeypatch.setattr(
+        aux,
+        "get_text_auxiliary_client",
+        lambda task, main_runtime=None: (
+            SimpleNamespace(base_url="https://relay.example/v1/", api_key="k"),
+            "uncatalogued-relay-model",
+        ),
+    )
+    resolved = MagicMock(return_value=128_000)
+    monkeypatch.setattr(mm, "get_model_context_length", resolved)
+    compressor = MagicMock()
+    compressor.context_length = MagicMock()
+    compressor.threshold_tokens = 64_000
+    agent = SimpleNamespace(
+        compression_enabled=True,
+        model="uncatalogued-relay-model",
+        base_url="https://relay.example/v1",
+        provider="custom",
+        _custom_providers=None,
+        _aux_compression_context_length_config=None,
+        _current_main_runtime=lambda: None,
+        status_callback=None,
+        _emit_status=lambda message: None,
+        context_compressor=compressor,
+    )
+
+    cc.check_compression_model_feasibility(agent)
+
+    assert resolved.call_count == 1
+    assert compressor.context_length is not resolved
