@@ -74,6 +74,26 @@ def _make_controller(tmp_path, monkeypatch, *, mode="observe", profile_name="chi
     return controller, agent
 
 
+def test_profile_is_inferred_from_hermes_home_without_profile_env_vars(tmp_path, monkeypatch):
+    hermes_root = tmp_path / ".hermes"
+    profile_dir = hermes_root / "profiles" / "chief-of-staff"
+    profile_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_ACTIVE_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+
+    config = GovernanceConfig.from_mapping(
+        {"mode": "observe", "workspace_dir": "engagements"}
+    )
+    controller = GovernanceController(_make_agent(), config)
+
+    assert controller.profile_name == "chief-of-staff"
+    assert controller._resolve_workspace_dir() == profile_dir / "engagements"
+
+
 def _prepare_dispatched_request(controller: GovernanceController, request_id: str, estimate: int = 80) -> str:
     controller.reserve_request(request_id, estimate)
     controller.record_dispatch(request_id)

@@ -549,7 +549,8 @@ class GovernanceController:
         m = re.search(r"[\\/]profiles[\\/]([^\\/]+)[\\/]config\.yaml$", config_path)
         if m:
             return m.group(1)
-        return "default"
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name()
 
     def _discover_role(self) -> str:
         seed = getattr(self.agent, "_governance_seed", None)
