@@ -1495,6 +1495,50 @@ def _run_conversation_turn(
         except Exception:
             pass
 
+    # Keep ordinary conversational turns on the smallest useful tool surface.
+    if (
+        governance is not None
+        and governance.mode in {"observe", "enforce"}
+        and not getattr(agent, "_governance_tool_schema_failed_closed", False)
+    ):
+        role_toolsets = list(getattr(agent, "_governance_base_toolsets", []) or [])
+        desired_mode = (
+            "conversational"
+            if governance.request_class == "conversational"
+            else "full"
+        )
+        current_mode = getattr(agent, "_governance_tool_mode", None)
+        if (
+            role_toolsets
+            and desired_mode != current_mode
+            and (desired_mode == "conversational" or current_mode == "conversational")
+        ):
+            governed_toolsets = (
+                ["skills"]
+                if governance.request_class == "conversational" and "skills" in role_toolsets
+                else role_toolsets
+            )
+            try:
+                from tools.mcp_tool_agent import refresh_agent_mcp_tools
+                refresh_agent_mcp_tools(
+                    agent,
+                    enabled_override=governed_toolsets,
+                    quiet_mode=True,
+                )
+                agent.tools = governance.filter_tool_schemas(agent.tools or [])
+                agent.valid_tool_names = {
+                    tool["function"]["name"] for tool in agent.tools
+                }
+                agent._governance_tool_mode = desired_mode
+            except Exception:
+                agent._governance_tool_schema_failed_closed = True
+                agent.tools = []
+                agent.valid_tool_names = set()
+                _ra().logger.warning(
+                    "Governance tool snapshot refresh failed",
+                    exc_info=True,
+                )
+
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not
     # the next; a SessionDB append failure (and its classified cause) halts only this turn;

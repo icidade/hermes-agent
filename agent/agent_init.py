@@ -1061,6 +1061,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # governed schema rather than a later, cache-breaking replacement.
     agent.cost_context_governance = None
     agent._governance_role = "chief" if getattr(agent, "_delegate_depth", 0) == 0 else "sme"
+    agent._governance_role_toolsets = []
+    agent._governance_base_toolsets = []
+    agent._governance_tool_mode = None
+    agent._governance_tool_schema_failed_closed = False
     _enabled_toolsets_runtime = enabled_toolsets
     _gov_cfg = {}
     try:
@@ -1069,6 +1073,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
 
         _gov_cfg = (_load_gov_cfg().get("cost_context_governance") or {})
         _role_allow = list(((_gov_cfg.get("role_toolsets") or {}).get(agent._governance_role) or []))
+        agent._governance_role_toolsets = list(_role_allow)
         _effective_enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else None
         if _gov_cfg.get("mode") in {"observe", "enforce"} and _role_allow:
             if _effective_enabled_toolsets is None:
@@ -1078,6 +1083,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
                 _effective_enabled_toolsets = [ts for ts in _effective_enabled_toolsets if ts in _role_allow_set]
             if not _effective_enabled_toolsets:
                 _effective_enabled_toolsets = list(_role_allow)
+        agent._governance_base_toolsets = list(_effective_enabled_toolsets or [])
         agent.cost_context_governance = build_governance_controller(agent, _gov_cfg)
         _enabled_toolsets_runtime = (
             list(_effective_enabled_toolsets) if _effective_enabled_toolsets is not None else None
@@ -1096,6 +1102,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         try:
             agent.tools = agent.cost_context_governance.filter_tool_schemas(agent.tools or [])
         except Exception as exc:
+            agent._governance_tool_schema_failed_closed = True
             _ra().logger.warning("Governance tool schema filtering failed closed: %s", type(exc).__name__)
             agent.tools = []
 
