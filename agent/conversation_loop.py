@@ -1598,7 +1598,9 @@ def _run_conversation_turn(
                     request_id=s.api_request_id,
                     messages=s.messages,
                     approx_request_tokens=int(s.request_pressure_tokens or s.approx_tokens or 0),
-                    api_call_count=s.api_call_count,
+                    # Governance expects completed calls; this counter is the
+                    # 1-based ordinal of the current primary request.
+                    api_call_count=max(0, s.api_call_count - 1),
                     logical_call_id=allocated["logical_call_id"],
                     attempt_id=allocated["attempt_id"],
                     request_kind="primary",
@@ -1646,6 +1648,9 @@ def _run_conversation_turn(
                         s._turn_exit_reason = "governance_logical_compaction_persistence_error"
                         break
                     if isinstance(compaction_result, dict) and compaction_result.get("stop"):
+                        governance.release_request(
+                            s.api_request_id, "governance_logical_compaction_stop"
+                        )
                         s.final_response = compaction_result.get("message") or "Execução pausada pela governança de custo/contexto."
                         s.failed = False
                         s._turn_exit_reason = compaction_result.get("termination_reason") or "cost_context_governance_hard_stop"
