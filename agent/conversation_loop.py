@@ -1526,6 +1526,17 @@ def _run_conversation_turn(
                     quiet_mode=True,
                 )
                 agent.tools = governance.filter_tool_schemas(agent.tools or [])
+                _inventory_text = str(_ctx.user_message or "").lower()
+                _skills_inventory_request = (
+                    "skill" in _inventory_text
+                    and any(marker in _inventory_text for marker in ("liste", "list", "nomes", "names"))
+                )
+                if _skills_inventory_request:
+                    agent.tools = [
+                        tool for tool in agent.tools
+                        if tool.get("function", {}).get("name") == "skills_list"
+                    ]
+                    governance.record_tool_schema_metrics(agent.tools or [], [])
                 agent.valid_tool_names = {
                     tool["function"]["name"] for tool in agent.tools
                 }
