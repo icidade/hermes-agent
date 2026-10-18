@@ -1672,13 +1672,23 @@ class GovernanceController:
         self.record_context_manifest(messages)
         if self.state is not None:
             self.state.usage.context_tokens_max = max(self.state.usage.context_tokens_max, context_tokens)
+        budget = self._profile_budget()
         action = self._threshold_action(
             self._projected_model_ratio(approx_request_tokens, current_model_calls, context_tokens)
         )
+        context_ratio = max(context_tokens, int(approx_request_tokens)) / max(
+            1, int(budget.context_tokens_per_request)
+        )
+        context_action = self._threshold_action(context_ratio)
         if self._is_trusted_qa_actor() and action in {"informational", "warning", "approval"}:
             action = "allow"
         if self._qa_headroom_violation(projected_total_tokens=approx_request_tokens, projected_model_calls=1):
             action = "approval" if action != "hard_stop" else action
+        compact_for_warning = (
+            request_kind == "primary"
+            and action == "warning"
+            and context_action == "warning"
+        )
         payload = {
             "request_id": request_id,
             "logical_call_id": logical_call_id,
@@ -1722,8 +1732,7 @@ class GovernanceController:
                         }
                     )
                     if (
-                        request_kind == "primary"
-                        and action == "warning"
+                        compact_for_warning
                         and int(logical_entry.get("preflight_count", 0))
                         >= int(self.config.progress.logical_call_max_preflights)
                     ):
@@ -1755,7 +1764,7 @@ class GovernanceController:
                 reason="human_budget_authorization",
                 authorization_id=authorization.get("authorization_id"),
             )
-        elif action == "warning" and request_kind == "primary":
+        elif action == "warning" and compact_for_warning:
             contract = self._decision_payload(
                 request_id=request_id,
                 action=action,
@@ -1763,6 +1772,13 @@ class GovernanceController:
                 reason="threshold_warning_requires_compaction",
                 compact_context=True,
                 termination_reason="threshold_warning",
+            )
+        elif action == "warning":
+            contract = self._decision_payload(
+                request_id=request_id,
+                action=action,
+                allowed=True,
+                reason="threshold_warning_advisory",
             )
         elif action in {"approval", "hard_stop"}:
             contract = self._decision_payload(

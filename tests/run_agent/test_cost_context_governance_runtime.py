@@ -192,6 +192,75 @@ def test_tool_schema_filtering_reaches_provider_payload(agent, monkeypatch):
     assert agent.cost_context_governance._tool_schema_metrics["serialized_schema_size"] > 0
 
 
+
+def test_skill_inventory_restores_configured_tools_on_next_turn(agent, monkeypatch):
+    import tools.mcp_tool_agent as mcp_tool_agent
+
+    monkeypatch.setattr(
+        agent.cost_context_governance, "_threshold_action", lambda _ratio: "allow"
+    )
+    role_toolsets = ["file", "search", "skills", "terminal"]
+    agent._governance_base_toolsets = list(role_toolsets)
+    agent._governance_tool_mode = None
+
+    refresh_calls = []
+    schemas_by_toolset = {
+        "file": ["read_file"],
+        "search": ["search_files"],
+        "skills": ["skills_list", "skill_view", "skill_manage"],
+        "terminal": ["terminal"],
+    }
+
+    def _schema(name):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+    def _refresh(_agent, *, enabled_override=None, quiet_mode=False, **_kwargs):
+        enabled = list(enabled_override or [])
+        refresh_calls.append(enabled)
+        _agent.tools = [
+            _schema(name)
+            for toolset in enabled
+            for name in schemas_by_toolset.get(toolset, [])
+        ]
+        return set()
+
+    monkeypatch.setattr(mcp_tool_agent, "refresh_agent_mcp_tools", _refresh)
+
+    captured = []
+
+    def _capture(**kwargs):
+        captured.append(kwargs)
+        return _mock_response(
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        )
+
+    agent.client.chat.completions.create.side_effect = _capture
+
+    first = agent.run_conversation("Liste apenas os nomes das skills disponíveis.")
+    second = agent.run_conversation(
+        "Pode me dizer quanto de espaço livre ainda tem no storage da VPS?"
+    )
+
+    assert first["completed"] is True
+    assert second["completed"] is True
+    assert refresh_calls == [["skills"], role_toolsets]
+    assert {
+        tool["function"]["name"] for tool in captured[0]["tools"]
+    } == {"skills_list"}
+    assert {
+        tool["function"]["name"] for tool in captured[1]["tools"]
+    } == {
+        "read_file", "search_files", "skills_list",
+        "skill_view", "skill_manage", "terminal",
+    }
+
 def test_schema_filter_failure_never_sends_unfiltered_tools(agent, monkeypatch):
     canary = (
         "secret-schema-filter path=/home/vpsadmin/.hermes/private/schema.json"

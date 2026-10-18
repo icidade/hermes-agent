@@ -1495,27 +1495,32 @@ def _run_conversation_turn(
         except Exception:
             pass
 
-    # Keep ordinary conversational turns on the smallest useful tool surface.
+    # Restrict only explicit skill-inventory requests; ordinary conversation
+    # keeps the Chief's configured tool surface.
     if (
         governance is not None
         and governance.mode in {"observe", "enforce"}
         and not getattr(agent, "_governance_tool_schema_failed_closed", False)
     ):
         role_toolsets = list(getattr(agent, "_governance_base_toolsets", []) or [])
-        desired_mode = (
-            "conversational"
-            if governance.request_class == "conversational"
-            else "full"
+        _inventory_text = str(_ctx.user_message or "").lower()
+        _skills_inventory_request = (
+            "skill" in _inventory_text
+            and any(marker in _inventory_text for marker in ("liste", "list", "nomes", "names"))
         )
+        if governance.request_class == "conversational":
+            desired_mode = "skills_inventory" if _skills_inventory_request else "conversational"
+        else:
+            desired_mode = "full"
         current_mode = getattr(agent, "_governance_tool_mode", None)
         if (
             role_toolsets
             and desired_mode != current_mode
-            and (desired_mode == "conversational" or current_mode == "conversational")
+            and (current_mode is not None or desired_mode == "skills_inventory")
         ):
             governed_toolsets = (
                 ["skills"]
-                if governance.request_class == "conversational" and "skills" in role_toolsets
+                if desired_mode == "skills_inventory" and "skills" in role_toolsets
                 else role_toolsets
             )
             try:
@@ -1526,12 +1531,7 @@ def _run_conversation_turn(
                     quiet_mode=True,
                 )
                 agent.tools = governance.filter_tool_schemas(agent.tools or [])
-                _inventory_text = str(_ctx.user_message or "").lower()
-                _skills_inventory_request = (
-                    "skill" in _inventory_text
-                    and any(marker in _inventory_text for marker in ("liste", "list", "nomes", "names"))
-                )
-                if _skills_inventory_request:
+                if desired_mode == "skills_inventory":
                     agent.tools = [
                         tool for tool in agent.tools
                         if tool.get("function", {}).get("name") == "skills_list"

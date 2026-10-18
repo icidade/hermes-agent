@@ -975,6 +975,62 @@ def test_allocate_request_identity_persists_attempt_ordinals_across_reconstructi
     assert logical_entry["next_attempt_ordinal"] == 4
 
 
+def test_engagement_warning_does_not_consume_compaction_preflight(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(tmp_path, monkeypatch, mode="enforce")
+    controller.begin_turn(
+        user_message="hello",
+        system_message="system",
+        messages=[],
+        task_id="engagement-warning",
+    )
+    controller.config.progress.logical_call_max_preflights = 1
+    monkeypatch.setattr(controller, "_projected_model_ratio", lambda *_args: 0.71)
+
+    decision = controller.before_model_call(
+        request_id="engagement-warning:req:1",
+        logical_call_id="engagement-warning:logical:1",
+        messages=[{"role": "user", "content": "hello"}],
+        approx_request_tokens=50,
+        api_call_count=0,
+    )
+
+    assert decision["action"] == "warning"
+    assert decision["allowed"] is True
+    assert decision["compact_context"] is False
+    assert decision["reservation_id"] == "engagement-warning:req:1"
+
+
+def test_context_warning_still_requests_compaction(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(tmp_path, monkeypatch, mode="enforce")
+    controller.begin_turn(
+        user_message="hello",
+        system_message="system",
+        messages=[],
+        task_id="context-warning",
+    )
+    budget = controller._profile_budget()
+    request_tokens = max(1, int(budget.context_tokens_per_request * 0.75))
+    monkeypatch.setattr(controller, "_projected_model_ratio", lambda *_args: 0.71)
+    monkeypatch.setattr(
+        controller,
+        "_threshold_action",
+        lambda ratio: "warning" if ratio >= 0.70 else "allow",
+    )
+
+    decision = controller.before_model_call(
+        request_id="context-warning:req:1",
+        logical_call_id="context-warning:logical:1",
+        messages=[{"role": "user", "content": "hello"}],
+        approx_request_tokens=request_tokens,
+        api_call_count=0,
+    )
+
+    assert decision["action"] == "warning"
+    assert decision["allowed"] is False
+    assert decision["compact_context"] is True
+    assert decision["termination_reason"] == "threshold_warning"
+
+
 def test_informational_decision_is_explicitly_allowed_in_observe(tmp_path, monkeypatch):
     controller, _agent = _make_controller(tmp_path, monkeypatch, mode="observe")
     controller.begin_turn(user_message="review", system_message="system", messages=[], task_id="info-observe")
