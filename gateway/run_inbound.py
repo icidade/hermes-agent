@@ -1138,6 +1138,63 @@ class GatewayInboundMixin:
             _reply = await self._hm_slash_confirm_reply(event, _quick_key)
         return _reply
 
+    def _hm_handle_budget_authorization_text(
+        self, event: "MessageEvent", source: SessionSource, _quick_key: str
+    ) -> Optional[str]:
+        """Consume exact owner budget decisions before they can reach the model."""
+        if (
+            getattr(event, "internal", False)
+            or getattr(event, "allow_gateway_control", False) is not True
+        ):
+            return None
+
+        raw = str(getattr(event, "text", "") or "").strip()
+        if not raw.split(maxsplit=1) or raw.split(maxsplit=1)[0] != "!budget":
+            return None
+
+        parts = raw.split()
+        if (
+            len(parts) != 3
+            or parts[0] != "!budget"
+            or parts[1] not in {"approve", "deny"}
+            or not parts[2].startswith("auth-")
+            or len(parts[2]) != 37
+            or any(char not in "0123456789abcdef" for char in parts[2][5:])
+        ):
+            return "Formato: `!budget approve <ID>` ou `!budget deny <ID>`."
+
+        cached = getattr(self, "_agent_cache", {}).get(_quick_key)
+        agent = cached[0] if isinstance(cached, tuple) else cached
+        controller = getattr(agent, "cost_context_governance", None) if agent else None
+        if controller is None:
+            return "Não encontrei uma autorização de budget ativa para esta sessão."
+
+        platform = getattr(source.platform, "value", source.platform)
+        principal = {
+            "authenticated": True,
+            "authentication_source": "gateway_adapter",
+            "subject": str(source.user_id or ""),
+            "platform": str(platform or ""),
+            "profile": controller.profile_name,
+            "engagement_id": controller.engagement_id,
+            "chat_id": str(source.chat_id or ""),
+            "task_id": controller.task_id,
+        }
+        approved = parts[1] == "approve"
+        try:
+            controller.submit_budget_authorization_text_command(
+                authorization_id=parts[2],
+                principal=principal,
+                approved=approved,
+                reason="Authenticated exact text command",
+            )
+        except Exception:
+            return "Autorização não processada: inválida, expirada ou fora do escopo deste chat."
+
+        if approved:
+            return "Aumento de budget aprovado uma vez. Envie uma mensagem normal para retomar a solicitação pausada."
+        return "Aumento de budget recusado; a solicitação continua pausada."
+
     async def _hm_dispatch_idle_commands(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Tuple[bool, Optional[str]]:
@@ -1217,6 +1274,10 @@ class GatewayInboundMixin:
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
+
+        _budget_reply = self._hm_handle_budget_authorization_text(event, source, _quick_key)
+        if _budget_reply is not None:
+            return _budget_reply
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

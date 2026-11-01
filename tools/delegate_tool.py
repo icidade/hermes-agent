@@ -68,36 +68,35 @@ def _normalize_role(r: Optional[str]) -> str:
 
 
 def _infer_governance_role(goal: str, context: Optional[str], *, child_depth: int) -> str:
-    """Map delegated work to the governance lane without changing execution role."""
-    text = f"{goal or ''}\n{context or ''}".lower()
-    if any(marker in text for marker in ("security qa", "security-qa", "qa review", "quality assurance", "final review")):
-        return "qa"
     return "sme" if child_depth > 0 else "chief"
 
 
-def _apply_governance_toolset_cap(parent_agent: Any, child_toolsets: list[str], *, governance_role: str) -> list[str]:
-    """Narrow inherited toolsets before child construction; never create a tool-less child."""
-    if getattr(parent_agent, "cost_context_governance", None) is None:
-        return child_toolsets
-    try:
-        cfg = _load_config().get("cost_context_governance") or {}
-        allowed = list((cfg.get("role_toolsets") or {}).get(governance_role) or [])
-        if cfg.get("mode") not in {"observe", "enforce"} or not allowed:
-            return child_toolsets
-        narrowed = [toolset for toolset in child_toolsets if toolset in set(allowed)]
-        return narrowed or child_toolsets
-    except Exception as exc:
-        logger.debug("Governance child toolset narrowing failed: %s", exc)
+def _apply_governance_toolset_cap(parent_agent, child_toolsets, *, governance_role):
+    controller = getattr(parent_agent, "cost_context_governance", None)
+    config = getattr(controller, "config", None)
+
+    mode = getattr(config, "mode", None)
+    role_toolsets = getattr(config, "role_toolsets", None)
+
+    if mode not in {"observe", "enforce"} or not isinstance(role_toolsets, dict):
         return child_toolsets
 
+    allowed = role_toolsets.get(governance_role)
+    if allowed is None and governance_role != "chief":
+        allowed = role_toolsets.get("sme")
+
+    if allowed is None:
+        return child_toolsets
+
+    allowed_set = set(allowed)
+    return [toolset for toolset in child_toolsets if toolset in allowed_set]
+
+
+
 DEFAULT_MAX_ITERATIONS = 250
-_HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
-# Stale-heartbeat thresholds (cycles of _HEARTBEAT_INTERVAL with no progress). Progress = iteration, current_tool OR
-# last_activity_ts advancing; an in-flight model wait refreshes last_activity_ts, so slow models are not "idle". Idle
-# stays tight so a truly wedged child doesn't mask the gateway timeout; in-tool is much higher so legitimately long
-# tools can finish.
-_HEARTBEAT_STALE_CYCLES_IDLE = 15  # 450s idle between turns → stale
-_HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 1200s stuck on same tool → stale
+_HEARTBEAT_INTERVAL = 30
+_HEARTBEAT_STALE_CYCLES_IDLE = 15
+_HEARTBEAT_STALE_CYCLES_IN_TOOL = 40
 
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
@@ -200,6 +199,7 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    profile: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -221,8 +221,38 @@ def _build_child_agent(
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
-    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
-    governance_role = _infer_governance_role(goal, context, child_depth=child_depth)
+    from agent.delegated_profile import (
+        prepare_binding,
+        construction_scope,
+        profile_scope,
+        narrow_toolsets,
+        bind_initial_governance,
+    )
+
+    binding = prepare_binding(
+        parent_agent,
+        routes=delegation_cfg.get("profile_routes", {}),
+        profile=profile,
+        session_id=subagent_id,
+        depth=child_depth,
+    )
+
+    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(
+        parent_agent, toolsets, effective_role
+    )
+
+    if binding.home is not None:
+        with profile_scope(binding.home):
+            from hermes_cli.config import load_config_readonly
+            profile_config = load_config_readonly()
+
+        profile_toolsets = profile_config.get("toolsets")
+        if not isinstance(profile_toolsets, list):
+            raise ValueError("Delegated profile must declare a toolsets list")
+
+        child_toolsets = narrow_toolsets(child_toolsets, profile_toolsets)
+
+    governance_role = binding.role
     child_toolsets = _apply_governance_toolset_cap(
         parent_agent, child_toolsets, governance_role=governance_role
     )
@@ -257,13 +287,15 @@ def _build_child_agent(
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
-    with delegated_child_context():
+    with delegated_child_context(), construction_scope(binding):
         try:
             child = AIAgent(
                 **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
                 enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
                 ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
                 skip_context_files=True, skip_memory=True, clarify_callback=None,
+                load_soul_identity=binding.home is not None,
+                session_id=subagent_id,
                 thinking_callback=(
                     (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                     if child_progress_cb else None
@@ -272,6 +304,7 @@ def _build_child_agent(
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )
+            bind_initial_governance(child)
         except BaseException:
             # No child close() will ever run: release the dedicated handle here.
             if child_session_db is not None:
@@ -290,22 +323,6 @@ def _build_child_agent(
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
-    if getattr(parent_agent, "cost_context_governance", None) is not None:
-        try:
-            seed = parent_agent.cost_context_governance.allocate_child_budget(
-                child_task_id=subagent_id,
-                requested_profile=getattr(parent_agent, "_governance_profile_key", None),
-                selected_agents=[effective_role],
-                governance_role=governance_role,
-            )
-            seed["selected_agents"] = [effective_role]
-            setattr(child, "_governance_seed", seed)
-            setattr(child, "_governance_engagement_id", seed.get("engagement_id"))
-            setattr(child, "_governance_profile_key", str(seed.get("profile_key") or "bounded"))
-            setattr(child, "_governance_request_class", str(seed.get("request_class") or "engagement"))
-            setattr(child, "_governance_role", governance_role)
-        except Exception as exc:
-            logger.debug("Governance child budget allocation failed: %s", exc)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
     try:
@@ -335,7 +352,26 @@ def _build_child_agent(
         )
     return child
 
-def _run_single_child(
+def _run_single_child(*args, **kwargs):
+    from agent.delegated_profile import profile_scope
+    from pathlib import Path
+
+    child = kwargs.get("child", args[2] if len(args) > 2 else None)
+    home = getattr(child, "_delegated_profile_home", None)
+
+    with profile_scope(home if isinstance(home, Path) else None):
+        result = _run_single_child_scoped(*args, **kwargs)
+
+    profile = getattr(child, "_delegated_profile_name", None)
+    if isinstance(result, dict) and isinstance(profile, str):
+        result["profile"] = profile
+        result["governance_role"] = child._governance_role
+        result["child_session_id"] = child.session_id
+
+    return result
+
+
+def _run_single_child_scoped(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
 ) -> Dict[str, Any]:
@@ -446,10 +482,18 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent,
+                role=_normalize_role(t.get("role") or top_role),
+                profile=t.get("profile"),
+                **overrides,
             )
-        except ValueError as exc:
-            return [], str(exc)
+        except Exception as exc:
+            for _, _, built_child in children:
+                with _quiet("Failed to close an undispatched child", exc_info=True):
+                    built_child.close()
+            if isinstance(exc, ValueError):
+                return [], str(exc)
+            raise
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -641,6 +685,24 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+
+    routes = _load_config().get("profile_routes", {})
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["items"] = {
+        **tasks["items"],
+        "properties": dict(tasks["items"]["properties"]),
+    }
+
+    if routes:
+        tasks["items"]["properties"]["profile"] = {
+            "type": "string",
+            "enum": sorted(routes),
+            "description": "Configured specialist profile. Use security-qa for independent QA.",
+        }
+        tasks["items"]["required"] = [
+            *tasks["items"].get("required", []),
+            "profile",
+        ]
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]

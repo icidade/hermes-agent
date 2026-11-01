@@ -625,9 +625,114 @@ class GovernanceController:
     def resolve_or_create_engagement_identity(self) -> EngagementIdentity:
         raw_id = self._raw_engagement_id_candidate()
         normalized = _normalize_optional_identifier(raw_id)
-        engagement_id = self._validate_engagement_id(normalized or self._generate_engagement_id())
         persistence_root = self._resolve_workspace_dir().resolve()
-        engagement_path = self._validate_engagement_path(persistence_root / engagement_id, persistence_root)
+        seed = getattr(self.agent, "_governance_seed", None)
+        session_id = str(getattr(self.agent, "session_id", "") or "").strip()
+        is_root_session = (
+            bool(session_id)
+            and getattr(self.agent, "_delegate_depth", 0) == 0
+            and not (
+                isinstance(seed, dict)
+                and _normalize_optional_identifier(seed.get("engagement_id"))
+            )
+        )
+
+        if is_root_session:
+            session_key = hashlib.sha256(
+                f"{self.profile_name}\\0{session_id}".encode("utf-8")
+            ).hexdigest()
+            index_path = persistence_root / ".session-engagement-index.json"
+            lock_path = index_path.with_suffix(index_path.suffix + ".lock")
+
+            with _InterProcessLock(lock_path):
+                try:
+                    index = json.loads(index_path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    index = {"version": 1, "sessions": {}}
+                except UnicodeError as exc:
+                    raise GovernanceArtifactError(
+                        artifact=index_path.name,
+                        category="encoding",
+                        detail=type(exc).__name__,
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    raise GovernanceArtifactError(
+                        artifact=index_path.name,
+                        category="invalid_json",
+                        detail=type(exc).__name__,
+                    ) from exc
+                except OSError as exc:
+                    raise GovernanceArtifactError(
+                        artifact=index_path.name,
+                        category="read_failure",
+                        detail=type(exc).__name__,
+                    ) from exc
+
+                if (
+                    not isinstance(index, dict)
+                    or index.get("version") != 1
+                    or not isinstance(index.get("sessions"), dict)
+                ):
+                    raise GovernanceArtifactError(
+                        artifact=index_path.name,
+                        category="invalid_structure",
+                    )
+
+                sessions = index["sessions"]
+                mapped_id = sessions.get(session_key)
+                if mapped_id is not None:
+                    try:
+                        engagement_id = self._validate_engagement_id(mapped_id)
+                    except (TypeError, ValueError) as exc:
+                        raise GovernanceArtifactError(
+                            artifact=index_path.name,
+                            category="invalid_session_mapping",
+                        ) from exc
+                    if normalized and normalized != engagement_id:
+                        seed = getattr(self.agent, "_governance_seed", None)
+                        explicit_seed_id = (
+                            _normalize_optional_identifier(seed.get("engagement_id"))
+                            if isinstance(seed, dict) else None
+                        )
+                        if explicit_seed_id:
+                            raise GovernanceArtifactError(
+                                artifact=index_path.name,
+                                category="session_identity_conflict",
+                            )
+                else:
+                    engagement_id = self._validate_engagement_id(
+                        normalized or self._generate_engagement_id()
+                    )
+                    sessions[session_key] = engagement_id
+                    index["sessions"] = sessions
+
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            "w",
+                            delete=False,
+                            dir=persistence_root,
+                            encoding="utf-8",
+                        ) as fh:
+                            fh.write(_json_dumps(index))
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                            tmp_name = fh.name
+                        Path(tmp_name).replace(index_path)
+                    except OSError as exc:
+                        raise GovernanceArtifactError(
+                            artifact=index_path.name,
+                            category="persistence_failure",
+                            detail=type(exc).__name__,
+                        ) from exc
+        else:
+            engagement_id = self._validate_engagement_id(
+                normalized or self._generate_engagement_id()
+            )
+
+        engagement_path = self._validate_engagement_path(
+            persistence_root / engagement_id,
+            persistence_root,
+        )
         identity = EngagementIdentity(
             engagement_id=engagement_id,
             persistence_root=persistence_root,
@@ -999,9 +1104,12 @@ class GovernanceController:
         self._budget_file.update(mutate)
         self._authorization_audit("authorization_requested", record)
         instructions = (
-            "Use only the authenticated callback to submit this Telegram decision; "
-            f"it expires at {record['expires_at']} and carries the server-side envelope. "
-            "Ordinary chat messages are never authorization."
+            f"Para aprovar este aumento uma única vez, envie exatamente: "
+            f"`!budget approve {authorization_id}`. Para recusar, envie "
+            f"`!budget deny {authorization_id}`. O pedido acrescenta "
+            f"{envelope['total_tokens']} tokens e {envelope['total_model_calls']} chamada(s); "
+            f"limite de contexto por requisição: {envelope['context_tokens_per_request']} tokens. "
+            f"Expira em {record['expires_at']}. Mensagens como “autorizo” não aprovam."
         )
         return {
             "authorization_id": authorization_id,
@@ -1031,9 +1139,12 @@ class GovernanceController:
         approved: bool,
         envelope: dict[str, Any] | None,
         reason: str,
+        _allow_owner_reference: bool = False,
     ) -> dict[str, Any]:
         if self._budget_file is None or not self.should_enforce():
             raise RuntimeError("budget authorization callback requires active enforce governance")
+        if _allow_owner_reference and (callback_token is not None or envelope is not None):
+            raise RuntimeError("text authorization cannot supply a token or envelope")
         expected_capability = getattr(self.agent, "_governance_callback_capability", None)
         if expected_capability is None or callback_capability is not expected_capability:
             raise RuntimeError("authenticated callback capability required")
@@ -1041,9 +1152,11 @@ class GovernanceController:
             raise RuntimeError("budget authorization decision must be bool")
         if not isinstance(reason, str) or not reason.strip():
             raise RuntimeError("budget authorization reason is required")
-        if callback_token is None and (not authorization_id or nonce is None):
+        if callback_token is None and not authorization_id:
             raise RuntimeError("authorization callback reference required")
-        if callback_token is None and envelope is None:
+        if callback_token is None and nonce is None and not _allow_owner_reference:
+            raise RuntimeError("authorization nonce required")
+        if callback_token is None and envelope is None and not _allow_owner_reference:
             raise RuntimeError("authorization envelope required")
         normalized_envelope = self._validate_authorization_envelope(envelope) if envelope is not None else None
         outcome: dict[str, Any] = {}
@@ -1078,7 +1191,7 @@ class GovernanceController:
                 outcome = dict(record)
                 return data
             expected_hash = str(record.get("nonce_hash") or "")
-            if callback_token is None:
+            if callback_token is None and not _allow_owner_reference:
                 actual_hash = hashlib.sha256(str(nonce or "").encode("utf-8")).hexdigest()
                 if not expected_hash or not hmac.compare_digest(expected_hash, actual_hash):
                     raise RuntimeError("budget authorization nonce mismatch")
@@ -1146,6 +1259,25 @@ class GovernanceController:
             approved=approved,
             envelope=None,
             reason=reason,
+        )
+
+    def submit_budget_authorization_text_command(
+        self,
+        *,
+        authorization_id: str,
+        principal: dict[str, Any],
+        approved: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Consume a text decision bound to the authenticated owner and saved envelope."""
+        return self.submit_budget_authorization(
+            authorization_id=authorization_id,
+            callback_capability=getattr(self.agent, "_governance_callback_capability", None),
+            principal=principal,
+            approved=approved,
+            envelope=None,
+            reason=reason,
+            _allow_owner_reference=True,
         )
 
     def _consume_budget_authorization(
