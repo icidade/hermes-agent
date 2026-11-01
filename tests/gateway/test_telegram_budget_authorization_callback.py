@@ -454,3 +454,74 @@ def test_telegram_message_source_normalizes_chat_identity_once(
 
     assert source.chat_type == expected_type
     assert source.thread_id == expected_thread
+
+def test_text_authorization_uses_saved_envelope_and_cannot_be_reused(tmp_path):
+    agent, controller = _agent(tmp_path)
+    challenge = _challenge(controller)
+
+    result = controller.submit_budget_authorization_text_command(
+        authorization_id=challenge["authorization_id"],
+        principal=_principal(controller),
+        approved=True,
+        reason="authenticated text approval",
+    )
+
+    assert result["status"] == "authorized"
+    assert result["approved_envelope"] == _envelope()
+    assert agent.client.chat.completions.create.call_count == 0
+
+    with pytest.raises(RuntimeError, match="is authorized"):
+        controller.submit_budget_authorization_text_command(
+            authorization_id=challenge["authorization_id"],
+            principal=_principal(controller),
+            approved=True,
+            reason="replay",
+        )
+
+def test_authenticated_text_budget_command_is_consumed_before_llm(tmp_path):
+    agent, controller = _agent(tmp_path)
+    challenge = _challenge(controller)
+    runner = _runner_for(agent)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-123",
+        chat_type="dm",
+        user_id="owner-123",
+        profile="chief-of-staff",
+    )
+    event = SimpleNamespace(
+        text=f"!budget approve {challenge['authorization_id']}",
+        allow_gateway_control=True,
+        internal=False,
+    )
+
+    response = runner._hm_handle_budget_authorization_text(event, source, "telegram-key")
+
+    assert "aprovado uma vez" in response
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["status"] == "authorized"
+    assert record["approved_envelope"] == _envelope()
+    assert agent.client.chat.completions.create.call_count == 0
+
+
+def test_untrusted_event_cannot_submit_text_budget_authorization(tmp_path):
+    agent, controller = _agent(tmp_path)
+    challenge = _challenge(controller)
+    runner = _runner_for(agent)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-123",
+        chat_type="dm",
+        user_id="owner-123",
+        profile="chief-of-staff",
+    )
+    event = SimpleNamespace(
+        text=f"!budget approve {challenge['authorization_id']}",
+        allow_gateway_control=False,
+        internal=False,
+    )
+
+    assert runner._hm_handle_budget_authorization_text(event, source, "telegram-key") is None
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["status"] == "pending"
+    assert agent.client.chat.completions.create.call_count == 0

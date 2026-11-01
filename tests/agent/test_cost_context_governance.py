@@ -749,6 +749,45 @@ def test_invalid_engagement_identity_is_replaced_before_path_construction(tmp_pa
     assert controller._engagement_dir().resolve().is_relative_to(controller.root_dir.resolve())
 
 
+
+def test_root_engagement_identity_survives_agent_reconstruction(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(
+        tmp_path, monkeypatch, mode="enforce", session_id="telegram-session-stable"
+    )
+    controller.begin_turn(
+        user_message="assessment",
+        system_message="system",
+        messages=[],
+        task_id="telegram-session-stable",
+    )
+    engagement_id = controller.engagement_id
+    controller._budget_file.update(
+        lambda data: {
+            **data,
+            "consumed": {**data["consumed"], "total_tokens": 123},
+        }
+    )
+
+    # Simula a reconstrução do AIAgent após reinício do gateway:
+    # mesma sessão, sem atributos de governança preservados em memória.
+    fresh_agent = _make_agent(session_id="telegram-session-stable")
+    rebuilt = GovernanceController(fresh_agent, controller.config)
+
+    assert rebuilt.engagement_id == engagement_id
+    rebuilt.begin_turn(
+        user_message="continue",
+        system_message="system",
+        messages=[],
+        task_id="telegram-session-stable",
+    )
+    assert rebuilt._root_snapshot()["consumed"]["total_tokens"] == 123
+
+    new_session = GovernanceController(
+        _make_agent(session_id="telegram-session-new"),
+        controller.config,
+    )
+    assert new_session.engagement_id != engagement_id
+
 def test_same_parent_and_child_share_engagement_identity(tmp_path, monkeypatch):
     parent, agent = _make_controller(tmp_path, monkeypatch, mode="enforce")
     parent.begin_turn(user_message="parent", system_message="system", messages=[], task_id="parent-task")
@@ -770,11 +809,10 @@ def test_same_parent_and_child_share_engagement_identity(tmp_path, monkeypatch):
 
 def test_same_engagement_uses_same_path_across_instances(tmp_path, monkeypatch):
     controller, agent = _make_controller(tmp_path, monkeypatch, mode="enforce")
-    agent._governance_engagement_id = "eng-fixed"
     one = GovernanceController(agent, controller.config)
     two = GovernanceController(agent, controller.config)
 
-    assert one.engagement_id == two.engagement_id == "eng-fixed"
+    assert one.engagement_id == two.engagement_id == controller.engagement_id
     assert one._engagement_dir() == two._engagement_dir()
 
 
@@ -1135,7 +1173,8 @@ def test_valid_human_authorization_applies_once_to_new_request_without_mutating_
     assert paused["allowed"] is False
     assert paused["pause"] is (blocked_action == "approval")
     assert paused["stop"] is (blocked_action == "hard_stop")
-    assert "authenticated callback" in paused["message"]
+    assert f"!budget approve {challenge['authorization_id']}" in paused["message"]
+    assert f"!budget deny {challenge['authorization_id']}" in paused["message"]
 
     approved_envelope = _explicit_increment(tokens=1200, calls=1, per_request=800)
     approved_envelope["operation"] = envelope_operation
