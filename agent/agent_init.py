@@ -1075,7 +1075,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         _role_allow = list(((_gov_cfg.get("role_toolsets") or {}).get(agent._governance_role) or []))
         agent._governance_role_toolsets = list(_role_allow)
         _effective_enabled_toolsets = list(enabled_toolsets) if enabled_toolsets is not None else None
-        if _gov_cfg.get("mode") in {"observe", "enforce"} and _role_allow:
+        if _gov_cfg.get("mode") in {"observe", "enforce", "log", "block"} and _role_allow:
             if _effective_enabled_toolsets is None:
                 _effective_enabled_toolsets = list(_role_allow)
             else:
@@ -1091,7 +1091,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         # An explicitly enabled governance mode must not silently lose its
         # storage boundary; absent or disabled configuration remains optional.
-        if (_gov_cfg or {}).get("mode") == "enforce":
+        if (_gov_cfg or {}).get("mode") in {"enforce", "block"}:
             raise RuntimeError("Governança não conseguiu resolver o storage decisório; provider bloqueado.") from None
 
     agent.tools = _ra().get_tool_definitions(

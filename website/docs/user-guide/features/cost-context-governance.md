@@ -9,7 +9,7 @@ description: "Bound model and tool work with observable budgets, checkpoints, an
 Cost & Context Governance is an optional controller for work whose model,
 tool, delegation, or context usage needs an explicit envelope. It observes
 the request lifecycle, records compact operational metadata, and—when
-`enforce` is selected—can stop provider and tool execution before the next
+`block` is selected—can stop provider and tool execution before the next
 operation would exceed the envelope or rely on untrusted state.
 
 It is not a provider billing system, a policy engine, or a replacement for
@@ -24,12 +24,16 @@ Configure the controller under `cost_context_governance.mode`:
 | Mode | Behavior |
 | --- | --- |
 | `disabled` | Do not create an active governance envelope. A small status artifact records that the operator disabled the controller. |
-| `observe` | Run the lifecycle and emit artifacts and telemetry, but keep enforcement decisions informational where possible. |
-| `enforce` | Apply the envelope and fail closed when accounting, identity, decision, schema, or persistence state cannot be trusted. |
+| `log` | Run the lifecycle and emit artifacts and telemetry without rejecting ordinary work exclusively because a consumption budget was exceeded. Platform context windows and unrelated safety/security controls still apply. |
+| `block` | Apply the envelope and fail closed when accounting, identity, decision, schema, or persistence state cannot be trusted. |
+
+`observe` and `enforce` remain accepted compatibility aliases for `log` and
+`block`. New configuration and operational output use the explicit names.
 
 The code default is `disabled`. A deployment may enable the controller in
 `config.yaml`; the mode is read when the agent is constructed and is not
-changed in the middle of a conversation.
+changed in the middle of a conversation except through the authenticated
+out-of-band control plane described below.
 
 ## Request classification and identity
 
@@ -102,12 +106,12 @@ Each outbound model or tool operation follows the same control boundary:
    later missing or malformed.
 3. **Dispatch** — mark the request as dispatched only after the dispatch
    transition is durably recorded. A failure to persist this transition
-   latches the controller and blocks the provider/tool path in `enforce`.
+   latches the controller and blocks the provider/tool path in `block`.
 4. **Reconcile and finalize** — normalize provider usage, reconcile it once
    by stable request ID, release a pre-dispatch reservation when no provider
    call occurred, and close the request in a terminal state.
 5. **Accounting latch** — a dispatch, reconciliation, or related persistence
-   failure remains visible across controller reconstruction. In `enforce`, new
+   failure remains visible across controller reconstruction. In `block`, new
    outbound work remains blocked until the state is reconciled.
 
 The persisted request states distinguish normal completion from
@@ -139,7 +143,7 @@ payload cannot contain tools outside the child's allowed toolsets.
 The execution role (`leaf` or `orchestrator`) is distinct from the governance
 role (`chief`, `sme`, or `qa`). The QA reserve is calculated independently for
 model calls and total tokens. Non-QA work cannot consume the protected reserve
-in `enforce`; a trusted QA lane may use its allocation, but it also stops when
+in `block`; a trusted QA lane may use its allocation, but it also stops when
 that allocation is exhausted.
 
 ## Context pressure and compaction
@@ -163,7 +167,7 @@ is released before dispatch.
 
 ## Blocking behavior
 
-In `enforce`, governance blocks both sides of the operation:
+In `block`, governance blocks both sides of the operation:
 
 - provider calls are blocked before dispatch when the envelope, identity,
   decision, or accounting state is not valid;
@@ -174,14 +178,14 @@ In `enforce`, governance blocks both sides of the operation:
 - a failed dispatch/accounting transition latches the controller and blocks
   subsequent outbound work.
 
-In `observe`, these conditions remain visible through status and telemetry,
+In `log`, these conditions remain visible through status and telemetry,
 but the runtime can continue where the implementation explicitly allows an
 informational result. Observe does not turn invalid state into a successful
 accounting record.
 
 ## Human authorization
 
-When `enforce` pauses an operation for `approval` or reaches `hard_stop`, the
+When `block` pauses an operation for `approval` or reaches `hard_stop`, the
 controller creates a request-scoped authorization record. Approval or denial
 is handled before another LLM call; an ordinary chat message is not an
 authorization channel.
@@ -197,6 +201,55 @@ envelope through the callback.
 An unauthenticated, ambiguous, failed, or mismatched callback is a terminal
 denial. Telegram authorization errors do not fall through to an environment
 allow-all setting, pairing, or another profile's scoped configuration.
+
+The requested one-time envelope includes bounded resume headroom (the larger
+of 1,024 tokens or 5% by default). This covers the deterministic overhead of a
+separate resume message. The grant is persisted and restored after expected
+agent or gateway reconstruction. If the resumed request still exceeds the
+approved cap, Hermes retains the grant and reports a new explicit requirement
+instead of returning a generic governance failure.
+
+The durable authorization lifecycle is `requested → approved → reserved →
+resumed → consumed`. Reservation is atomic with request admission; a
+pre-provider release returns the grant to `approved`, while dispatch advances
+it to `resumed` and reconciled provider usage advances it to `consumed`.
+Authenticated callback retries are idempotent, and every transition is written
+to the authorization audit log.
+
+## Out-of-band administration
+
+The gateway recognizes these exact commands before LLM execution:
+
+```text
+!governance status
+!governance mode log
+!governance mode block
+```
+
+They are shared by gateway transports, including Telegram and Slack. Access
+is fail-closed and bound to stable platform user IDs configured for the active
+profile; usernames and display names are not accepted:
+
+```yaml
+cost_context_governance:
+  mode: block
+  administrators:
+    telegram: ["123456789"]
+    slack: ["U0123456789"]
+```
+
+An absent platform allowlist denies the command. A successful mode change is
+atomically persisted to the active profile's `config.yaml`, updates cached
+controllers, and appends a local audit event to
+`governance/admin-audit.jsonl`. The audit hashes the platform subject.
+
+An authenticated local operator can use the budget-independent CLI path:
+
+```bash
+python -m agent.governance_admin status
+python -m agent.governance_admin mode log
+python -m agent.governance_admin mode block
+```
 
 ## Artifacts and telemetry
 
@@ -232,16 +285,16 @@ are intentionally absent from persisted governance payloads.
 
 An absent artifact can be created during legitimate initialization. An
 existing artifact is not silently treated as a fresh default when it fails
-validation. The controller records a sanitized artifact error; in `enforce`,
+validation. The controller records a sanitized artifact error; in `block`,
 the affected operation fails closed and the provider/tool path is blocked. In
-`observe`, the condition remains informational and is exposed through the
+`log`, the condition remains informational and is exposed through the
 status/telemetry path without claiming canonical accounting.
 
 ## Safe rollout and operations
 
 Recommended rollout:
 
-1. Start with `mode: observe`.
+1. Start with `mode: log`.
 2. Verify that `brief.json`, `budget.json`, checkpoints, handoffs, and
    telemetry are created under the intended profile home.
 3. Check that usage, reservations, child allocations, and QA reserve values
@@ -249,7 +302,7 @@ Recommended rollout:
 4. Exercise a bounded delegated task and a compaction episode; confirm that
    the child starts with its narrowed toolsets and that a recovered episode
    rearms.
-5. Move to `mode: enforce` only after the telemetry and artifact lifecycle are
+5. Move to `mode: block` only after the telemetry and artifact lifecycle are
    understood.
 
 If the accounting latch is active, inspect the sanitized checkpoint,
@@ -257,15 +310,14 @@ partial-handoff, `budget.json` request state, and telemetry transition for the
 affected request. Reconcile or discard the incomplete operation before
 resuming; do not manually mark a provider call as successful.
 
-Rollback is configuration-only: set `cost_context_governance.mode` back to
-`observe` for diagnostic continuation or `disabled` to turn the active
-controller off, using the normal `hermes config set` command. These are the
-supported mode controls; governance does not provide an undocumented schema
-migration or a separate rollback command.
+Rollback is configuration-only: use `!governance mode log` (or the local CLI)
+for diagnostic continuation, or set `disabled` locally to turn the active
+controller off. Chat administration intentionally exposes only `log` and
+`block`; it cannot disable governance or alter unrelated safeguards.
 
 ## Known limitations
 
-- In `observe`, an identity failure can allow a provider call without
+- In `log`, an identity failure can allow a provider call without
   canonical accounting; the event is marked non-canonical rather than being
   presented as a normal governed result.
 - Partial handoff persistence is best-effort when the storage layer is

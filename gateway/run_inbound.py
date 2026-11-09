@@ -1192,8 +1192,33 @@ class GatewayInboundMixin:
             return "Autorização não processada: inválida, expirada ou fora do escopo deste chat."
 
         if approved:
-            return "Aumento de budget aprovado uma vez. Envie uma mensagem normal para retomar a solicitação pausada."
+            return (
+                "Aumento de budget aprovado e persistido para uma tentativa. "
+                "A próxima retomada compatível consumirá o grant atomicamente; se outro limite impedir "
+                "a execução, ele será informado explicitamente."
+            )
         return "Aumento de budget recusado; a solicitação continua pausada."
+
+    def _hm_handle_governance_admin(self, event: "MessageEvent", source: SessionSource) -> Optional[str]:
+        """Dispatch the authenticated control plane before any LLM/session work."""
+        if getattr(event, "internal", False) or getattr(event, "allow_gateway_control", False) is not True:
+            return None
+        raw = str(getattr(event, "text", "") or "").strip()
+        if not raw.split(maxsplit=1) or raw.split(maxsplit=1)[0].lower() != "!governance":
+            return None
+        from agent.governance_admin import execute_gateway_command
+
+        controllers = []
+        candidates = list(getattr(self, "_agent_cache", {}).values())
+        candidates.extend((getattr(self, "_running_agents", None) or {}).values())
+        seen = set()
+        for cached in candidates:
+            agent = cached[0] if isinstance(cached, tuple) else cached
+            controller = getattr(agent, "cost_context_governance", None) if agent else None
+            if controller is not None and id(controller) not in seen:
+                seen.add(id(controller))
+                controllers.append(controller)
+        return execute_gateway_command(raw, source=source, controllers=controllers)
 
     async def _hm_dispatch_idle_commands(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -1258,6 +1283,10 @@ class GatewayInboundMixin:
         # — Discord interaction passthrough builds its own MessageEvent and
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
+
+        _governance_reply = self._hm_handle_governance_admin(event, source)
+        if _governance_reply is not None:
+            return _governance_reply
 
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:

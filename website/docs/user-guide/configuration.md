@@ -148,8 +148,13 @@ Hermes can attach a governance envelope to expensive work so it classifies the r
 
 ```yaml
 cost_context_governance:
-  mode: disabled                   # disabled | observe | enforce
+  mode: disabled                   # disabled | log | block (observe/enforce are legacy aliases)
   workspace_dir: engagements       # relative to the active profile home
+  approval_resume_headroom_tokens: 1024
+  approval_resume_headroom_ratio: 0.05
+  administrators:                  # stable platform IDs; no username/display-name matching
+    telegram: []
+    slack: []
   default_profile: conversational
   force_for_profiles: [chief-of-staff]
   engagement_keywords:
@@ -251,13 +256,15 @@ cost_context_governance:
 Notes:
 
 - The code defaults are `mode: disabled`, `workspace_dir: engagements`, and `default_profile: conversational`.
+- `approval_resume_headroom_tokens` and `approval_resume_headroom_ratio` reserve deterministic capacity for the authenticated resume message. The larger margin is included in the envelope shown to the approver; it is never added silently after approval.
+- `administrators` is an explicit per-platform allowlist for the out-of-band `!governance` commands. Missing or empty platform lists deny administration.
 - `force_for_profiles` is a `list[str]`, defaulting to `["chief-of-staff"]`. A profile in this list does not force every request into engagement; it makes a security/miniciso request an `engagement` using `standard_engagement` when no earlier classification rule matched.
 - `engagement_keywords` is a `list[str]`, defaulting to `["miniciso", "security", "assessment", "review", "threat model", "appsec", "bug bounty"]`. Hermes lowercases the message and checks whether any configured keyword occurs as a substring; a match selects `engagement` with `standard_engagement`.
 - Classification precedence is: delegated child inheritance; `engagement_keywords`; `force_for_profiles` for messages containing `security` or `miniciso`; generic markers `review`, `assessment`, `investigate`, or `analyze` (selecting `bounded`); otherwise `conversational`. For example, `engagement_keywords: ["audit"]` makes `"audit the config"` an engagement, while `force_for_profiles: []` removes only the profile-based security/miniciso fallback.
 - The request classes are `conversational`, `bounded`, and `engagement`; the built-in budget profile keys are `conversational`, `bounded`, `standard_engagement`, `deep_engagement`, and `custom`.
 - `profiles` accept `total_model_calls`, `calls_per_agent`, `calls_per_delegated_task`, `input_tokens`, `output_tokens`, `total_tokens`, `context_tokens_per_request`, `wall_clock_seconds`, `tool_invocations`, `retries`, `delegation_count`, `iterations_without_progress`, and `qa_reserve_ratio`.
 - `role_toolsets` defaults to an empty mapping. When configured, its role allowlist is applied to delegated children before construction.
-- `observe` records lifecycle state and remains informative; `enforce` can pause or hard-stop before provider/tool execution when the state is not trustworthy.
+- `log` records lifecycle state without consumption-budget rejection; `block` can pause or hard-stop before provider/tool execution when the state is not trustworthy. `observe`/`enforce` remain compatibility aliases.
 
 For the actual artifact paths, request lifecycle, authorization boundary, and safe rollout procedure, see [Cost & Context Governance](/user-guide/features/cost-context-governance).
 

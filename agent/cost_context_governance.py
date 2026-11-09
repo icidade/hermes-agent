@@ -243,6 +243,8 @@ class GovernanceConfig:
     threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
     progress: ProgressConfig = field(default_factory=ProgressConfig)
     role_toolsets: dict[str, list[str]] = field(default_factory=dict)
+    approval_resume_headroom_tokens: int = 1024
+    approval_resume_headroom_ratio: float = 0.05
     profiles: dict[str, BudgetProfile] = field(default_factory=lambda: {
         "conversational": BudgetProfile(
             total_model_calls=3,
@@ -312,6 +314,12 @@ class GovernanceConfig:
             threshold=threshold,
             progress=progress,
             role_toolsets={str(k): list(v or []) for k, v in dict(data.get("role_toolsets") or {}).items()},
+            approval_resume_headroom_tokens=max(
+                0, _safe_int(data.get("approval_resume_headroom_tokens"), base.approval_resume_headroom_tokens)
+            ),
+            approval_resume_headroom_ratio=max(
+                0.0, _safe_float(data.get("approval_resume_headroom_ratio"), base.approval_resume_headroom_ratio)
+            ),
             profiles=profiles,
         )
 
@@ -540,6 +548,55 @@ class GovernanceController:
         self._dispatch_failure_latched = False
         self._artifact_failure: GovernanceArtifactError | None = None
         setattr(self.agent, "_cost_context_governance_mode", self.mode)
+        self._restore_authorized_resume()
+
+    @property
+    def effective_policy(self) -> str:
+        if self.mode in {"enforce", "block"}:
+            return "block"
+        if self.mode in {"observe", "log"}:
+            return "log"
+        return "disabled"
+
+    def set_mode(self, mode: str) -> None:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in {"block", "log", "enforce", "observe", "disabled"}:
+            raise ValueError("governance mode must be block, log, or disabled")
+        self.mode = normalized
+        self.config.mode = normalized
+        setattr(self.agent, "_cost_context_governance_mode", normalized)
+
+    def _restore_authorized_resume(self) -> None:
+        """Restore a persisted one-time grant after agent/gateway reconstruction."""
+        path = self._engagement_dir() / "budget.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return
+        owner = self._authorization_owner()
+        if not owner:
+            return
+        now = datetime.now(timezone.utc)
+        candidates = []
+        for record in (data.get("budget_authorizations") or {}).values():
+            if not isinstance(record, dict) or record.get("status") != "authorized":
+                continue
+            if record.get("engagement_id") != self.engagement_id or record.get("profile") != self.profile_name:
+                continue
+            if record.get("task_id") != self.task_id or record.get("owner") != owner:
+                continue
+            try:
+                if now >= datetime.fromisoformat(str(record.get("expires_at"))):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            candidates.append(record)
+        if not candidates:
+            return
+        record = max(candidates, key=lambda item: str(item.get("decided_at") or item.get("created_at") or ""))
+        self.agent._governance_resume_authorization_id = record.get("authorization_id")
+        self.agent._governance_resume_logical_call_id = record.get("logical_call_id")
+        self.agent._governance_resume_task_id = record.get("task_id")
 
     def _discover_profile_name(self) -> str:
         env_profile = os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_ACTIVE_PROFILE")
@@ -805,6 +862,7 @@ class GovernanceController:
         payload = {
             "timestamp": _utc_now(),
             "mode": self.mode,
+            "effective_policy": self.effective_policy,
             "active": bool(active),
             "reason": reason,
             "profile": self.profile_name,
@@ -816,10 +874,13 @@ class GovernanceController:
         return path
 
     def is_active(self) -> bool:
-        return self.mode in {"observe", "enforce"}
+        return self.mode in {"observe", "enforce", "log", "block"}
 
     def should_enforce(self) -> bool:
-        return self.mode == "enforce"
+        return self.mode in {"enforce", "block"}
+
+    def should_log_only(self) -> bool:
+        return self.mode in {"observe", "log"}
 
     def _profile_budget(self) -> BudgetProfile:
         return self.config.profiles.get(self.profile_key, self.config.profiles[self.config.default_profile])
@@ -1071,6 +1132,7 @@ class GovernanceController:
             "nonce_hash": hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
             "callback_hash": hashlib.sha256(callback_token.encode("utf-8")).hexdigest(),
             "status": "pending",
+            "lifecycle_state": "requested",
             "engagement_id": self.engagement_id,
             "profile": self.profile_name,
             "task_id": self.task_id,
@@ -1171,7 +1233,6 @@ class GovernanceController:
                     (
                         key for key, candidate in authorizations.items()
                         if isinstance(candidate, dict)
-                        and candidate.get("status") == "pending"
                         and hmac.compare_digest(str(candidate.get("callback_hash") or ""), callback_hash)
                     ),
                     None,
@@ -1180,16 +1241,16 @@ class GovernanceController:
             if not isinstance(record, dict):
                 raise RuntimeError("unknown budget authorization")
             status = str(record.get("status") or "")
-            if status == "consumed":
-                raise RuntimeError("budget authorization already consumed")
-            if status != "pending":
+            if status not in {"pending", "authorized", "consumed", "denied"}:
                 raise RuntimeError(f"budget authorization is {status or 'invalid'}")
-            expires_at = datetime.fromisoformat(str(record.get("expires_at")))
-            if datetime.now(timezone.utc) >= expires_at:
-                record["status"] = "expired"
-                record["expired_at"] = _utc_now()
-                outcome = dict(record)
-                return data
+            if status == "pending":
+                expires_at = datetime.fromisoformat(str(record.get("expires_at")))
+                if datetime.now(timezone.utc) >= expires_at:
+                    record["status"] = "expired"
+                    record["lifecycle_state"] = "expired"
+                    record["expired_at"] = _utc_now()
+                    outcome = dict(record)
+                    return data
             expected_hash = str(record.get("nonce_hash") or "")
             if callback_token is None and not _allow_owner_reference:
                 actual_hash = hashlib.sha256(str(nonce or "").encode("utf-8")).hexdigest()
@@ -1212,7 +1273,20 @@ class GovernanceController:
                 raise RuntimeError("budget authorization chat mismatch")
             if str(principal.get("task_id") or "") != str(record.get("task_id") or ""):
                 raise RuntimeError("budget authorization task mismatch")
+            if status in {"authorized", "consumed"} and approved:
+                if normalized_envelope is not None and normalized_envelope != record.get("approved_envelope"):
+                    raise RuntimeError("idempotent authorization envelope mismatch")
+                outcome = dict(record)
+                outcome["idempotent_replay"] = True
+                return data
+            if status == "denied" and not approved:
+                outcome = dict(record)
+                outcome["idempotent_replay"] = True
+                return data
+            if status != "pending":
+                raise RuntimeError(f"budget authorization is {status or 'invalid'}")
             record["status"] = "authorized" if approved else "denied"
+            record["lifecycle_state"] = "approved" if approved else "denied"
             if approved and normalized_envelope is None:
                 normalized_envelope = self._validate_authorization_envelope(record.get("proposed_envelope"))
             record["approved_envelope"] = normalized_envelope if approved else None
@@ -1232,7 +1306,9 @@ class GovernanceController:
             self._authorization_audit("authorization_expired", outcome)
             raise RuntimeError("budget authorization expired")
         self._authorization_audit(
-            "authorization_authorized" if approved else "authorization_denied",
+            "authorization_idempotent_replay" if outcome.get("idempotent_replay") else (
+                "authorization_authorized" if approved else "authorization_denied"
+            ),
             outcome,
             authorized_by=outcome.get("authorized_by"),
             approved_envelope=outcome.get("approved_envelope"),
@@ -1317,8 +1393,17 @@ class GovernanceController:
                 raise RuntimeError("budget authorization requires a new request_id")
             envelope = self._validate_authorization_envelope(record.get("approved_envelope"))
             if approx_request_tokens > int(envelope["context_tokens_per_request"]):
-                raise RuntimeError("authorized per-request envelope is insufficient")
+                record["last_resume_failure"] = {
+                    "reason": "authorized_per_request_envelope_insufficient",
+                    "required_context_tokens": int(approx_request_tokens),
+                    "approved_context_tokens": int(envelope["context_tokens_per_request"]),
+                    "observed_at": _utc_now(),
+                }
+                return data
             record["status"] = "consumed"
+            record["lifecycle_state"] = "reserved"
+            record["reserved_at"] = _utc_now()
+            record["reserved_by_request_id"] = request_id
             record["consumed_at"] = _utc_now()
             record["consumed_by_request_id"] = request_id
             record["consumed_by_logical_call_id"] = logical_call_id
@@ -1334,7 +1419,7 @@ class GovernanceController:
         if consumed:
             self.agent._governance_resume_authorization_id = None
             self.agent._governance_resume_logical_call_id = None
-            self._authorization_audit("authorization_consumed", consumed, consumed_by_request_id=request_id)
+            self._authorization_audit("authorization_reserved", consumed, reserved_by_request_id=request_id)
         return consumed
 
     def log_event(self, event: str, payload: dict[str, Any]) -> None:
@@ -1343,6 +1428,8 @@ class GovernanceController:
         record = {
             "timestamp": _utc_now(),
             "event": event,
+            "governance_mode": self.mode,
+            "effective_policy": self.effective_policy,
             "engagement_id": self.engagement_id,
             "task_id": self.task_id,
             "session_id": getattr(self.agent, "session_id", None),
@@ -1881,7 +1968,7 @@ class GovernanceController:
                 logical_call_id=logical_call_id,
                 approx_request_tokens=approx_request_tokens,
             )
-        if self.mode == "observe":
+        if self.should_log_only():
             contract = self._decision_payload(
                 request_id=request_id,
                 action=action,
@@ -1988,7 +2075,7 @@ class GovernanceController:
                 if authorization is not None
                 else None
             )
-            if self.mode == "observe":
+            if self.should_log_only():
                 allowed = True
             elif authorized_envelope is not None:
                 if authorized_envelope["operation"] == "increment":
@@ -2090,10 +2177,22 @@ class GovernanceController:
             entry["state"] = "dispatched"
             entry["dispatch_count"] = int(entry.get("dispatch_count", 0)) + 1
             entry["updated_at"] = _utc_now()
+            authorization = entry.get("budget_authorization") or {}
+            authorization_id = authorization.get("authorization_id")
+            record = data.setdefault("budget_authorizations", {}).get(authorization_id)
+            if isinstance(record, dict) and record.get("lifecycle_state") == "reserved":
+                record["lifecycle_state"] = "resumed"
+                record["resumed_at"] = _utc_now()
+                record["resumed_by_request_id"] = request_id
             return self._refresh_budget_pools(data)
 
         pre = self._request_snapshot_view(self._root_snapshot(), request_id) if self._budget_file is not None else {}
         updated = self._budget_file.update(mutate)
+        entry = ((updated or {}).get("request_state") or {}).get(request_id) or {}
+        authorization_id = (entry.get("budget_authorization") or {}).get("authorization_id")
+        authorization_record = ((updated or {}).get("budget_authorizations") or {}).get(authorization_id)
+        if isinstance(authorization_record, dict) and authorization_record.get("lifecycle_state") == "resumed":
+            self._authorization_audit("authorization_resumed", authorization_record, resumed_by_request_id=request_id)
         after = self._request_snapshot_view(updated or {}, request_id)
         self._log_request_transition({
             "request_id": request_id,
@@ -2146,11 +2245,28 @@ class GovernanceController:
 
         terminal_state = "released_before_dispatch"
 
+        restored_authorization: dict[str, Any] = {}
+
         def mutate(data: dict) -> dict:
+            nonlocal restored_authorization
             reservations = data.setdefault("reservations", {})
             entry = self._request_state_entry(data, request_id)
             self._assert_request_transition(str(entry.get("state") or "created"), terminal_state, request_id=request_id)
             reservations.pop(request_id, None)
+            authorization = entry.get("budget_authorization") or {}
+            authorization_id = authorization.get("authorization_id")
+            record = data.setdefault("budget_authorizations", {}).get(authorization_id)
+            if isinstance(record, dict) and record.get("lifecycle_state") == "reserved":
+                record["status"] = "authorized"
+                record["lifecycle_state"] = "approved"
+                record["consumed_at"] = None
+                record["consumed_by_request_id"] = None
+                record["consumed_by_logical_call_id"] = None
+                record["reserved_at"] = None
+                record["reserved_by_request_id"] = None
+                record["released_at"] = _utc_now()
+                record["released_reason"] = reason
+                restored_authorization = dict(record)
             entry.update(
                 {
                     "state": terminal_state,
@@ -2163,6 +2279,16 @@ class GovernanceController:
 
         pre = self._request_snapshot_view(self._root_snapshot(), request_id) if self._budget_file is not None else {}
         updated = self._budget_file.update(mutate)
+        if restored_authorization:
+            self.agent._governance_resume_authorization_id = restored_authorization.get("authorization_id")
+            self.agent._governance_resume_logical_call_id = restored_authorization.get("logical_call_id")
+            self.agent._governance_resume_task_id = restored_authorization.get("task_id")
+            self._authorization_audit(
+                "authorization_released",
+                restored_authorization,
+                released_request_id=request_id,
+                reason=reason,
+            )
         after = self._request_snapshot_view(updated or {}, request_id)
         self._log_request_transition({
             "request_id": request_id,
@@ -2725,11 +2851,16 @@ class GovernanceController:
                 "approx_request_tokens": approx_request_tokens,
                 "context_manifest": self._context_manifest,
             })
+            resume_headroom = max(
+                int(self.config.approval_resume_headroom_tokens),
+                int(max(1, approx_request_tokens) * float(self.config.approval_resume_headroom_ratio)),
+            )
+            approved_request_capacity = max(1, int(approx_request_tokens)) + resume_headroom
             proposed_envelope = {
                 "operation": "increment",
-                "total_tokens": max(1, int(approx_request_tokens)),
+                "total_tokens": approved_request_capacity,
                 "total_model_calls": 1,
-                "context_tokens_per_request": max(1, int(approx_request_tokens)),
+                "context_tokens_per_request": approved_request_capacity,
             }
             authorization = self.create_budget_authorization(
                 blocked_request_id=request_id,
@@ -2853,6 +2984,27 @@ class GovernanceController:
                 response_text=response_text,
             )
             self.finalize_request(request_id, "success", "completed")
+            if self._budget_file is not None:
+                consumed_authorization: dict[str, Any] = {}
+
+                def mark_consumed(data: dict) -> dict:
+                    nonlocal consumed_authorization
+                    entry = self._request_state_entry(data, request_id)
+                    authorization = entry.get("budget_authorization") or {}
+                    record = data.setdefault("budget_authorizations", {}).get(authorization.get("authorization_id"))
+                    if isinstance(record, dict) and record.get("lifecycle_state") == "resumed":
+                        record["lifecycle_state"] = "consumed"
+                        record["provider_consumed_at"] = _utc_now()
+                        consumed_authorization = dict(record)
+                    return data
+
+                self._budget_file.update(mark_consumed)
+                if consumed_authorization:
+                    self._authorization_audit(
+                        "authorization_consumed",
+                        consumed_authorization,
+                        consumed_by_request_id=request_id,
+                    )
             return canonical
         except Exception as exc:
             self.account_dispatched_request_failure(
@@ -2918,7 +3070,7 @@ class GovernanceController:
             request_id=request_id,
             action=action,
             allowed=True,
-            reason=f"tool_threshold_{action}_observed" if self.mode == "observe" else f"tool_threshold_{action}",
+            reason=f"tool_threshold_{action}_observed" if self.should_log_only() else f"tool_threshold_{action}",
         )
 
     def record_tool_result(self, tool_name: str, tool_args: dict, result: str, *, is_error: bool, duration_seconds: float) -> None:

@@ -1205,6 +1205,7 @@ def test_valid_human_authorization_applies_once_to_new_request_without_mutating_
     assert snapshot["budget"] == budget_before
     record = snapshot["budget_authorizations"][challenge["authorization_id"]]
     assert record["status"] == "consumed"
+    assert record["lifecycle_state"] == "reserved"
     assert record["consumed_by_request_id"] == "auth-valid:req:2"
     assert record["consumed_by_logical_call_id"] == "auth-valid:logical:1"
     assert snapshot["consumed"]["total_tokens"] == 0
@@ -1212,18 +1213,73 @@ def test_valid_human_authorization_applies_once_to_new_request_without_mutating_
     assert challenge["nonce"] not in budget_text
     audit_path = tmp_path / "engagements" / controller.engagement_id / "authorization_audit.jsonl"
     audit_events = [json.loads(line)["event"] for line in audit_path.read_text(encoding="utf-8").splitlines()]
-    assert audit_events == ["authorization_requested", "authorization_authorized", "authorization_consumed"]
+    assert audit_events == ["authorization_requested", "authorization_authorized", "authorization_reserved"]
 
-    with pytest.raises(RuntimeError, match="already consumed"):
-        controller.submit_budget_authorization(
-            authorization_id=challenge["authorization_id"],
-            nonce=challenge["nonce"],
+    replay = controller.submit_budget_authorization(
+        authorization_id=challenge["authorization_id"],
+        nonce=challenge["nonce"],
         callback_capability=controller.agent._governance_callback_capability,
-            principal=_owner_principal(engagement_id=controller.engagement_id),
-            approved=True,
-            reason="authenticated owner decision",
-            envelope=_explicit_increment(),
-        )
+        principal=_owner_principal(engagement_id=controller.engagement_id),
+        approved=True,
+        reason="authenticated owner decision replay",
+        envelope=approved_envelope,
+    )
+    assert replay["idempotent_replay"] is True
+
+
+def test_authorized_grant_lifecycle_releases_before_dispatch_and_consumes_after_usage(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(tmp_path, monkeypatch, mode="block")
+    controller.begin_turn(user_message="security review", system_message="system", messages=[], task_id="auth-lifecycle")
+    monkeypatch.setattr(controller, "_threshold_action", lambda _ratio: "approval")
+    paused = controller.before_model_call(
+        request_id="auth-lifecycle:req:1",
+        logical_call_id="auth-lifecycle:logical:1",
+        messages=[{"role": "user", "content": "continue"}],
+        approx_request_tokens=700,
+        api_call_count=0,
+    )
+    challenge = paused["authorization"]
+    controller.submit_budget_authorization(
+        authorization_id=challenge["authorization_id"],
+        nonce=challenge["nonce"],
+        callback_capability=controller.agent._governance_callback_capability,
+        principal=_owner_principal(engagement_id=controller.engagement_id, task_id="auth-lifecycle"),
+        approved=True,
+        reason="authenticated owner decision",
+        envelope=_explicit_increment(tokens=2000, calls=1, per_request=2000),
+    )
+
+    controller.before_model_call(
+        request_id="auth-lifecycle:req:2",
+        logical_call_id="auth-lifecycle:logical:1",
+        messages=[{"role": "user", "content": "continue"}],
+        approx_request_tokens=700,
+        api_call_count=0,
+    )
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["lifecycle_state"] == "reserved"
+    controller.release_request("auth-lifecycle:req:2", "pre_provider_abort")
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["status"] == "authorized"
+    assert record["lifecycle_state"] == "approved"
+
+    controller.before_model_call(
+        request_id="auth-lifecycle:req:3",
+        logical_call_id="auth-lifecycle:logical:1",
+        messages=[{"role": "user", "content": "continue"}],
+        approx_request_tokens=700,
+        api_call_count=0,
+    )
+    controller.record_dispatch("auth-lifecycle:req:3")
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["lifecycle_state"] == "resumed"
+    controller.record_model_usage(
+        {"input_tokens": 650, "output_tokens": 50, "total_tokens": 700},
+        request_id="auth-lifecycle:req:3",
+        duration_seconds=0.1,
+    )
+    record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
+    assert record["lifecycle_state"] == "consumed"
 
 
 def test_expired_authorization_fails_closed(tmp_path, monkeypatch):
@@ -1375,3 +1431,87 @@ def test_authorization_callback_without_runtime_capability_fails_closed(tmp_path
             reason="authenticated owner decision",
             envelope=_explicit_increment(),
         )
+
+
+@pytest.mark.parametrize(
+    "mode, expected_policy, expected_allowed",
+    [("log", "log", True), ("block", "block", False)],
+)
+def test_explicit_policy_modes_apply_at_enforcement_point(
+    tmp_path, monkeypatch, mode, expected_policy, expected_allowed
+):
+    controller, _agent = _make_controller(tmp_path, monkeypatch, mode=mode)
+    controller.begin_turn(user_message="security review", system_message="system", messages=[], task_id="policy")
+    monkeypatch.setattr(controller, "_threshold_action", lambda _ratio: "hard_stop")
+
+    decision = controller.before_model_call(
+        request_id=f"policy:{mode}:1",
+        logical_call_id=f"policy:{mode}:logical",
+        messages=[{"role": "user", "content": "continue"}],
+        approx_request_tokens=100,
+        api_call_count=0,
+    )
+
+    assert controller.effective_policy == expected_policy
+    assert decision["allowed"] is expected_allowed
+    assert controller.should_enforce() is (mode == "block")
+
+
+def test_approval_includes_resume_headroom_and_accepts_followup_context_drift(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(tmp_path, monkeypatch, mode="block")
+    controller.begin_turn(user_message="security review", system_message="system", messages=[], task_id="drift")
+    monkeypatch.setattr(controller, "_threshold_action", lambda _ratio: "approval")
+    paused = controller.before_model_call(
+        request_id="drift:req:1",
+        logical_call_id="drift:logical",
+        messages=[{"role": "user", "content": "change governance mode"}],
+        approx_request_tokens=37197,
+        api_call_count=0,
+    )
+    challenge = paused["authorization"]
+    envelope = challenge["proposed_envelope"]
+    assert envelope["context_tokens_per_request"] >= 38221
+
+    controller.submit_budget_authorization_text_command(
+        authorization_id=challenge["authorization_id"],
+        principal=_owner_principal(engagement_id=controller.engagement_id, task_id="drift"),
+        approved=True,
+        reason="authenticated text approval",
+    )
+    resumed = controller.before_model_call(
+        request_id="drift:req:2",
+        logical_call_id="drift:logical",
+        messages=[{"role": "user", "content": "Continue"}],
+        approx_request_tokens=37352,
+        api_call_count=0,
+    )
+    assert resumed["allowed"] is True
+    assert resumed["reason"] == "human_budget_authorization"
+
+
+def test_authorized_grant_is_restored_after_agent_reconstruction(tmp_path, monkeypatch):
+    controller, _agent = _make_controller(
+        tmp_path, monkeypatch, mode="block", session_id="persistent-session"
+    )
+    controller.begin_turn(user_message="security review", system_message="system", messages=[], task_id="persistent-session")
+    challenge = controller.create_budget_authorization(
+        blocked_request_id="persistent:req:1",
+        logical_call_id="persistent:logical",
+        decision_action="approval",
+        proposed_envelope=_explicit_increment(tokens=2000, per_request=1500),
+    )
+    controller.submit_budget_authorization_text_command(
+        authorization_id=challenge["authorization_id"],
+        principal=_owner_principal(
+            engagement_id=controller.engagement_id, task_id="persistent-session"
+        ),
+        approved=True,
+        reason="authenticated text approval",
+    )
+
+    fresh_agent = _make_agent(session_id="persistent-session")
+    rebuilt = GovernanceController(fresh_agent, controller.config)
+
+    assert rebuilt.engagement_id == controller.engagement_id
+    assert fresh_agent._governance_resume_authorization_id == challenge["authorization_id"]
+    assert fresh_agent._governance_resume_logical_call_id == "persistent:logical"

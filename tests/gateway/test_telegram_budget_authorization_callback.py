@@ -230,7 +230,7 @@ def test_real_telegram_callback_rejects_other_user_or_chat(tmp_path, field, valu
     assert controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]["status"] == "pending"
 
 
-def test_callback_expiry_replay_and_concurrent_callbacks_are_single_use(tmp_path):
+def test_callback_expiry_and_concurrent_replays_are_idempotent(tmp_path):
     agent, controller = _agent(tmp_path)
     challenge = _challenge(controller)
     controller._budget_file.update(
@@ -275,7 +275,8 @@ def test_callback_expiry_replay_and_concurrent_callbacks_are_single_use(tmp_path
         thread.start()
     for thread in threads:
         thread.join()
-    assert sum(isinstance(item, dict) for item in outcomes) == 1
+    assert sum(isinstance(item, dict) for item in outcomes) == 2
+    assert sum(bool(item.get("idempotent_replay")) for item in outcomes if isinstance(item, dict)) == 1
     assert controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]["status"] == "authorized"
 
 
@@ -455,7 +456,7 @@ def test_telegram_message_source_normalizes_chat_identity_once(
     assert source.chat_type == expected_type
     assert source.thread_id == expected_thread
 
-def test_text_authorization_uses_saved_envelope_and_cannot_be_reused(tmp_path):
+def test_text_authorization_uses_saved_envelope_and_replay_is_idempotent(tmp_path):
     agent, controller = _agent(tmp_path)
     challenge = _challenge(controller)
 
@@ -470,13 +471,13 @@ def test_text_authorization_uses_saved_envelope_and_cannot_be_reused(tmp_path):
     assert result["approved_envelope"] == _envelope()
     assert agent.client.chat.completions.create.call_count == 0
 
-    with pytest.raises(RuntimeError, match="is authorized"):
-        controller.submit_budget_authorization_text_command(
-            authorization_id=challenge["authorization_id"],
-            principal=_principal(controller),
-            approved=True,
-            reason="replay",
-        )
+    replay = controller.submit_budget_authorization_text_command(
+        authorization_id=challenge["authorization_id"],
+        principal=_principal(controller),
+        approved=True,
+        reason="replay",
+    )
+    assert replay["idempotent_replay"] is True
 
 def test_authenticated_text_budget_command_is_consumed_before_llm(tmp_path):
     agent, controller = _agent(tmp_path)
@@ -497,7 +498,7 @@ def test_authenticated_text_budget_command_is_consumed_before_llm(tmp_path):
 
     response = runner._hm_handle_budget_authorization_text(event, source, "telegram-key")
 
-    assert "aprovado uma vez" in response
+    assert "aprovado e persistido" in response
     record = controller._root_snapshot()["budget_authorizations"][challenge["authorization_id"]]
     assert record["status"] == "authorized"
     assert record["approved_envelope"] == _envelope()
