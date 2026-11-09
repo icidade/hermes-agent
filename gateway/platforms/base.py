@@ -3545,6 +3545,15 @@ class BasePlatformAdapter(ABC):
         # races with the running task (split-brain, see PR #4926).
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
+        raw_text = str(getattr(event, "text", "") or "").strip()
+        if (
+            getattr(event, "allow_gateway_control", False) is True
+            and not getattr(event, "internal", False)
+            and raw_text.split(maxsplit=1)
+            and raw_text.split(maxsplit=1)[0].lower() == "!governance"
+        ):
+            await self._dispatch_inline_reply(event, log_cmd="governance")
+            return
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
